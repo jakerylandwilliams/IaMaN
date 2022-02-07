@@ -63,19 +63,22 @@ def make_TDM(documents, do_tfidf = True, space = True, normalize = True):
         TDM = (TDM.T.multiply(IDF)).T
     return(TDM, type_index)
 
-def get_context(i, sentence, m = 20, positional = True, normed = False):
-    context = np.array(sentence)
+def get_context(i, sentence, m = 20, positional = True, normed = False, lays = [], ltys = []):
     locs = np.array(range(len(sentence))) - i
-    dists = (lambda x: x-x[i])(np.cumsum(list(map(len, sentence))))
-    mask = (locs != 0) & (np.abs(locs) <= m) if m else (locs != 0)
-    # context = context[mask]
+    # dists = (lambda x: x-x[i])(np.cumsum(list(map(len, sentence))))
+    # mask = (locs != 0) & (np.abs(locs) <= m) if m else (locs != 0)
+    mask = (np.abs(locs) <= m) if m else np.array([True for loc in locs])
+    components = [np.concatenate([np.array(sentence)[mask]]+[np.array(l)[mask] for l in lays])]
     if positional:
-        if normed:
-            return list(zip(context[mask], dists[mask]))
-        else:
-            return list(zip(context[mask], locs[mask]))
-    else:
-        return context[mask]
+        # if normed:
+        #     weights = np.array(list(dists[mask])*(len(ltys)+1))
+        # else:
+        #     weights = np.array(list(locs[mask])*(len(ltys)+1))
+        weights = np.array(list(locs[mask])*(len(ltys)+1))
+        components.append(weights)
+    components.append(['form']*len(locs[mask]) + [ltype for lt, l in zip(ltys, lays) 
+                                                  for ltype in [lt]*len(locs[mask])])
+    return(list(zip(*components)))
 
 def make_CoM(documents, k = 20, gamma = 0, space = True, do_tficf = True, normalize = True):
     document_frequency = Counter()
