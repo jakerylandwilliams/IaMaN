@@ -141,9 +141,9 @@ class LM(ABC):
                            for i, t in enumerate(s)
                            for c in get_context(i, s, m = self._m, positional = self._positional)
                            if len(s) - 1])
-        self._T, self._C, self._Tds = Counter(), Counter(), defaultdict(Counter)
+        self._T, self._C, self._Tds, self._Tls = Counter(), Counter(), defaultdict(Counter), defaultdict(lambda : defaultdict(Counter))
         self._TCs = defaultdict(set); self._CTs = defaultdict(set); 
-        self._D = defaultdict(set)
+        self._D = defaultdict(set); self._L = defaultdict(lambda : defaultdict(set))
         self._Cp = Counter(); self._C_tot = 0
         for t, c in tqdm(self._X):
             self._X[(t,c)] = self._X[(t,c)]*self._zeta; self._T[t] += self._X[(t,c)]; self._C[c] += self._X[(t,c)]
@@ -183,7 +183,7 @@ class LM(ABC):
         self.tune(docs, lays = layers, ltys = ltypes)
         print('Indexing documents...')
         self._alphas = defaultdict(list); self._total_sentences = 0; self._total_tokens = 0; 
-        novs, oovs, eoss, eods = self.index_documents(docs)
+        novs, oovs, eoss, eods = self.index_documents(docs, ltypes, layers)
         assert(all([len(s_l) == len(s) for d_l, d in zip(novs, docs) for s_l, s in zip(d_l, d)]))
         assert(all([len(s_l) == len(s) for d_l, d in zip(oovs, docs) for s_l, s in zip(d_l, d)]))
         layers = [novs, oovs, eoss, eods] + layers
@@ -238,11 +238,11 @@ class LM(ABC):
                                                             whatever_norm in whatever_norms])
                     else:
                         print([(len(s_c), len(s_l)) for d_c, d_l in zip(covering, layer) for s_c, s_l in zip(d_c, d_l)])
-            ltypes = list(temp_ltypes); del(temp_ltypes)
-            layers = list(temp_layers); del(temp_layers)
+        ltypes = list(temp_ltypes); del(temp_ltypes)#######
+        layers = list(temp_layers); del(temp_layers)############
         return ltypes, layers
     
-    def index_documents(self, docs, modify_model = True):
+    def index_documents(self, docs, ltypes, layers, modify_model = True):
         novs = []; oovs = []; eoss = []; eods = [] ## collect other whatever-level layers
         for d_i, d in tqdm(list(enumerate(docs))):
             delta = 0; M = 0
@@ -279,6 +279,9 @@ class LM(ABC):
                         # record the tokens presence in the document
                         self._Tds[d_i][t] += 1
                         self._D[t].add(d_i)
+                        for li, ltype in enumerate(ltypes):
+                            self._Tls[ltype][layers[li][d_i][s_j][i]][t] += 1 
+                            self._L[ltype][t].add(layers[li][d_i][s_j][i])
             if modify_model:
                 self._total_tokens += M
             eods[d_i][s_j][-1] = True
@@ -371,7 +374,7 @@ class LM(ABC):
                         -np.log10([(self._beta[t]*(self._X[(t,c)]/self._T[t]) if (t,c) in self._X else 
                                    (1 - self._beta[t])/self._Cn[t]) for c in contexts]).sum()]) for t in ts}
     
-    def surface_LM(self, s, i, Td = Counter(), damping = 0.01, seed = None, lays = [], ltys = []):
+    def surface_LM(self, s, i, lays = [], ltys = []): 
         surface_Ps = self.batch_NLLs([(t, 'form') for t in self._ltypes['form'] if t], s, i, lays =lays, ltys = ltys)
         surface_Ps = {t: -surface_Ps[t] for t in surface_Ps} # once we optimize code, should clear unnecessary negations
         MaxPs_list = [surface_Ps[t] for t in surface_Ps if not np.isinf(surface_Ps[t])]
@@ -383,11 +386,11 @@ class LM(ABC):
         else:
             return Counter({t:0 for t in self._ltypes['form'] if t}); surface_Ps[''] = 1.
         
-    def topical_LM(self, Td = Counter(), damping = 0.01):
+    def topical_LM(self, Td, noise):
         if Td:
             # resonance provides nuance in modeling prob random doc contains token (specificity)
-            Dsums = {d_i: sum(self._Tds[d_i].values()) + len(self._D)*damping for d_i in self._Tds} # this should be a marginalized pre-compute
-            DPs = {d_i: -sum([Td[t]*np.log10((self._Tds[d_i].get(t, 0) + damping)/Dsums[d_i]) for t in Td]) 
+            Dsums = {d_i: sum(self._Tds[d_i].values()) + len(self._D)*noise for d_i in self._Tds} # this should be a marginalized pre-compute
+            DPs = {d_i: -sum([Td[t]*np.log10((self._Tds[d_i].get(t, 0) + noise)/Dsums[d_i]) for t in Td]) 
                    for d_i in self._Tds}
             MaxPs_list = [DPs[d_i] for d_i in DPs if not np.isinf(DPs[d_i])]
             MaxPs = np.max(MaxPs_list) if MaxPs_list else 0
@@ -396,10 +399,10 @@ class LM(ABC):
                 Psum = sum([xyz for xyz in DPs.values() if not np.isinf(xyz)] + [0])
                 DPs = Counter({d_i: (DPs[d_i]/Psum if not np.isinf(DPs[d_i]) else 0) for d_i in DPs})
             else:
-                DPs = Counter({d_i:1/self._Tds for d_i in self._Tds})
+                DPs = Counter({d_i:1/len(self._Tds) for d_i in self._Tds})
             # term frequency makes this object (e.g., weighted as immediately below ---> leave commented) un-useful, 
             # i.e., noise distributions should be uniform-ish
-            # topical_Ps = Counter({t: sum([DPs[d_i]*(self._Tds[d_i].get(t[0],0)+damping)/Dsums[d_i] for d_i in self._Tds]) 
+            # topical_Ps = Counter({t: sum([DPs[d_i]*(self._Tds[d_i].get(t[0],0)+noise)/Dsums[d_i] for d_i in self._Tds]) 
             #                       for t in self._ltypes['form'] if t})
             topical_Ps = {t: sum([DPs[d_i]*(1. if d_i in self._D[t[0]] else 0.) for d_i in self._Tds]) for t in self._ltypes['form'] if t}
             norm_const =  sum(topical_Ps.values())
@@ -413,50 +416,77 @@ class LM(ABC):
             norm_const =  sum(topical_Ps.values())
             return Counter({t: (topical_Ps[t]/norm_const) for t in self._ltypes['form'] if t})
     
-    # damping tells how strongly to attend to document specificty, with document-occurrence statistics for noise
-    # the smaller the damping factor is, the more strongly the noise will re-enforce similar-document vocabulary
-    def predict(self, s, i, Td = Counter(), damping = 0.01, seed = None, lays = [], ltys = []):
-        if seed is not None:
-            np.random.seed(seed)
-            
+    # noise tells how strongly to attend to document specificty, using document-occurrence statistics
+    # the smaller the noise factor is, the more strongly the noise will re-enforce similar-document vocabulary
+    def predict(self, s, i, Td = Counter(), noise = 0., resonance = 0., focus = 0., prose = 0., jargon = 0.,
+                lays = [], ltys = []):
         if i < 0:
             i = len(s) + i
         if i >= len(s):
             i = len(s) - 1
         
-        # co-occurrence based LM
-        CO_Ps = self.surface_LM(s, i, Td = Td, damping = damping, seed = seed, lays = lays, ltys = ltys)
-        # term-document frequency based LM
-        NO_Ps = self.topical_LM(Td = Td, damping = damping)
+        # at base, the localization, co-occurrence based LM probabilities
+        Ps = self.surface_LM(s, i, lays = lays, ltys = ltys)
+        
+        # bring near-token boundary awareness to the prediction
+        Ps = self.blend_layer(Ps, 0.9999, s, 'eot', i, lays, ltys, noise)
+        # bring near-sentence boundary awareness to the prediction
+        Ps = self.blend_layer(Ps, 0.9999, s, 'eos', i, lays, ltys, noise)
+        # bring near-document boundary awareness to the prediction
+        Ps = self.blend_layer(Ps, 0.9999, s, 'eod', i, lays, ltys, noise)
+        # bring novel whatever awareness to the prediction
+        Ps = self.blend_layer(Ps, 0.9999, s, 'nov', i, lays, ltys, noise)
+        # bring out-of-vocabulary whatever awareness to the prediction
+        Ps = self.blend_layer(Ps, 0.9999, s, 'oov', i, lays, ltys, noise)
+        
+        # clamps the vocabulary according to in-siteu generative statistics
+        if resonance:
+            # measures the local probability of an oov-token, or one that's new to the document        
+            alpha = self.predict_layer(s, 'nov', i = i, lays = lays, ltys = ltys)[(True, 'nov')] # p new to doc
+            sigma = self.predict_layer(s, 'oov', i = i, lays = lays, ltys = ltys)[(True, 'oov')] # p new to vocab
+            # in theory, theta (the average replication rate) should stabilize/temper generation over longer documents
+            if any([(t, 'form') in Ps for t in Td]):
+                theta = 1 - (np.mean(self._alphas.get(int(sum(Td.values())),
+                                                      [min([x for x in map(np.mean, self._alphas.values()) if x])])) 
+                             if Td else 1-len(self._D)/self._total_tokens)
+                pnew = ((1 - theta)*alpha*sigma*(1 - resonance))**(1/4)
+                Ps = self.novelty_clamp(Ps, pnew, Td)
+                
+        # jargon is a noise-sampling rate, and transfers probability between locality and topic
+        if jargon:
+            # coverage from the contexts measures certainty of localized information to temper jargon
+            jargon *= np.mean([self._Tp.get(c,0) for c in get_context(i, s, m = self._m, positional = self._positional)])
+            # blends the topical, term-document frequency based LM to elevate topic-specific jargon
+            Ps = self.blend_predictions(Ps, self.topical_LM(Td, noise), jargon)
             
-        # the novelty clamping, the average (1 - theta) appears to stabilize generation
-        alpha = (np.mean(self._alphas.get(int(sum(Td.values())),
-                                          [min([x for x in map(np.mean, self._alphas.values()) if x])])) if Td else 1-len(self._D)/self._total_tokens)
-        # sigma models the local probability of a novel word introduction, 
-        # when whose compliment is blended with the compliment of epsilon,
-        # (i.e., the local probability of an oov-token) as well as the coverage rate
-        # of the current locality of contexts determines how much smoothing to self-impose with noise
-        nov_Ps = Counter({(t, 'nov'): 10**-self.NLL((t, 'nov'), s, i, lays = lays, ltys = ltys) for t in self._ltypes['nov']})
-        nov_Ps = {t: nov_Ps[t]/sum(nov_Ps.values()) for t in nov_Ps}
-        oov_Ps = Counter({(t, 'oov'): 10**-self.NLL((t, 'oov'), s, i, lays = lays, ltys = ltys) for t in self._ltypes['oov']})
-        oov_Ps = {t: oov_Ps[t]/sum(oov_Ps.values()) for t in oov_Ps}
-
-        # smooths the local distributional model with the noise model according to a combination of factors:
-        # more/less coverage from the contexts, and certainty of generation w/r novelty & vocabulary expansion (not sure if functional)
-        # coverage = np.mean([self._Tp.get(c,0) for c in get_context(i, s, m = self._m, positional = self._positional)])
-        # epsilon = ((1 - coverage)*(1 - nov_Ps[(True, 'nov')])*oov_Ps[(True, 'oov')])**(1/3)
-        epsilon = ((1 - nov_Ps[(True, 'nov')])*oov_Ps[(True, 'oov')])**(1/2)
-        P = Counter({t: CO_Ps[t]*(1 - epsilon) + NO_Ps[t]*epsilon for t in CO_Ps})
-
-        # gets the total noise-local smoothed probability covered by the current document
-        TdP_tot = sum([P[t]  for t in P if (t[0] in Td)] + [0])
-        # clamps unseen words in this document over the noise-local smoothed distribution via alpha
-        if TdP_tot:
-            P = Counter({t: (P[t]*(1 - alpha)/TdP_tot if (t[0] in Td) else #   and TdP_tot
-                             P[t]*alpha)/(1 - TdP_tot) for t in P})
+        # LEM blending supports semantic stabilization
+        if 'lem' in self._ltypes and focus:
+            Ps = self.blend_layer(Ps, focus, s, 'lem', i, lays, ltys, noise)
+        # POS blending supports prose-like improvements
+        if 'pos' in self._ltypes and prose:
+            Ps = self.blend_layer(Ps, prose, s, 'pos', i, lays, ltys, noise)
+            
+        return Ps
+    
+    def blend_layer(self, Ps, transfer_p, s, ltype, i, lays, ltys, noise):
+        layer_Ps = self.predict_layer(s, ltype, i = i, lays = lays, ltys = ltys)
+        LAY_Ps = Counter({t: sum([layer_Ps[LAY]*((self._Tls[ltype][LAY[0]].get(t[0], 0) + noise)/
+                                                (self._T[LAY] + noise*len(Ps)))
+                                  for LAY in layer_Ps]) 
+                          for t in Ps})
+        return self.blend_predictions(Ps, LAY_Ps, transfer_p)
+    
+    def blend_predictions(self, P1, P2, transfer_p):
+        return Counter({t: P1[t]*(1 - transfer_p) + P2[t]*transfer_p for t in P1})
+    
+    def novelty_clamp(self, P, transfer_p, Td):
+        # gets the total probability covered by the current document
+        # TdP_tot = sum([P[t]  for t in P if (t[0] in Td)] + [0])
+        # clamps towards words unseen in this document by the transfer probabilty
+        P = Counter({t: (P[t]*(1 - transfer_p) if (t[0] in Td) else # /TdP_tot
+                         P[t]*transfer_p) for t in P}) # /(1 - TdP_tot)
         Ptot = sum(P.values())
-
-        return Counter({ti: P[ti]/Ptot for ti in P}), alpha, epsilon
+        return Counter({ti: P[ti]/Ptot for ti in P})
     
     def predict_layer(self, s, ltype, i = 0, lays = [], ltys = []): # now with batch_NLL for fast calculation
         # layer_Ps = Counter({(t, ltype): 10**-self.NLL((t, ltype), s, i, lays = lays, ltys = ltys) # (i if i else len(s)-1)
@@ -570,22 +600,21 @@ class LM(ABC):
             self._documents.append(Document(self._sentences, ix = self._sentences[0]._ix))
             self._sentences = []
 
-    def interpret(self, docs, Td = Counter(), damping = 0.01, seed = None, resonant = False, top = 0.99, covering = [], 
-                  ltypes = [], layers = [], vecs = True, pred_eos = False, pred_eod = False, digest = True):
+    def interpret(self, docs, Td = Counter(), noise = 0., resonance = 0., focus = 0., prose = 0., jargon = 0.,
+                  seed = None, covering = [], ltypes = [], layers = [], 
+                  vecs = True, pred_eos = False, pred_eod = False, digest = True):
         if seed is not None:
             np.random.seed(seed)
-        #############
         ## assert that _raw sentences_ (to be HR-BPE tokenized) is the only requirement for IaMaN-LM processes
         assert(all([type(text) == str for doc in docs for text in doc]))
         # build the model's whatever sequence
         print('Tokenizing documents...')
         docs = [[self.tokenizer.tokenize(text) for text in doc] for doc in tqdm(docs)]
+        # build up any known gold layers
+        self._d_ltypes, self._d_layers = self.build_layers(docs, covering, ltypes, layers) 
         # gather the boundary, vocab, and novelty information for the whatevers
         print('Indexing documents...')
-        self._novs, self._oovs, self._eoss, self._eods = self.index_documents(docs, modify_model = False)
-        # build up any known gold layers
-        self._d_ltypes, self._d_layers = self.build_layers(docs, covering, ltypes, layers) ## the eoss and eods should apparently be added?
-        # self._eots = self.build_eots(docs, covering) if covering else []
+        self._novs, self._oovs, self._eoss, self._eods = self.index_documents(docs, self._d_ltypes, self._d_layers, modify_model = False)
         eots = self.build_eots(docs, covering) if covering else []
         # build the document
         self._documents = []; self._sentences = []; self._tokens = []; self._whatevers = []
@@ -602,8 +631,8 @@ class LM(ABC):
                     eot = eots[self._d_i][self._s_i][wi] if eots else (self.sample_layer(s, 'eot', i = wis, seed = seed)[0] == "True")
                     vec = None
                     if vecs:
-                        P, _, _ = self.predict(self._s, wi, Td = Td + (Counter(self._s[:-1]) if resonant else Counter()), 
-                                               damping = damping, seed = seed)
+                        P = self.predict(self._s, wi, Td = Td + (Counter(self._s[:-1]) if resonance else Counter()), 
+                                         noise = noise, focus = focus, prose = prose, resonance = resonance, jargon = jargon)
                         vec = -np.log10([P[t] for t in P]) - np.log10(len(P))
                     
                     self.grok(wi, w, eot, w in self._w_set, (w, 'form') in self._T, vec, seed, pred_eos, pred_eod) # consider grokking first?
@@ -611,31 +640,27 @@ class LM(ABC):
         if digest:
             self.digest()
     
-    def generate(self, m = 1, docs = [], Td = Counter(), damping = 0.01, seed = None, resonant = False, top = 0.99, covering = [], 
+    def generate(self, m = 1, docs = [], Td = Counter(), noise = 0., resonance = 0., focus = 0., prose = 0., jargon = 0., 
+                 seed = None, top = 1., covering = [], 
                  ltypes = [], layers = [], pred_eos = True, pred_eod = True, generate_next = 't'):
         if seed is not None:
             np.random.seed(seed)
-        #############
+            
+        self._s = list(self._padding)
+        self._slayers = [list(self._padding) for l in set(self._ltypes.keys()) - 
+                         {'form', 'eot', 'nov', 'oov', 'eos', 'eod'}]
+        self._d_i = 0; self._s_i = 0
+        self._w_set = set(); self._ix = 0
+        self._d_ltypes, self._d_layers = self.build_layers(docs, covering, ltypes, layers)
+        self._novs, self._oovs, self._eoss, self._eods = self.index_documents(docs, self._d_ltypes, self._d_layers, modify_model = False)
+
         ## assert that _raw sentences_ (to be HR-BPE tokenized) is the only requirement for IaMaN-LM processes
         assert(all([type(text) == str for doc in docs for text in doc]))
         if docs:
-            self.interpret(docs, Td = Td, damping = damping, seed = seed, resonant = resonant, top = top, covering = covering, 
+            self.interpret(docs, Td = Td, noise = noise, seed = seed, resonance = resonance, covering = covering, 
                            ltypes = ltypes, layers = layers, pred_eos = pred_eos, pred_eod = pred_eod, vecs = True, digest = False)
         else:
             self._documents = []; self._sentences = []; self._tokens = []; self._whatevers = []
-        slayers = set(self._ltypes.keys()) - {'form', 'eot', 'nov', 'oov', 'eos', 'eod'}
-        try:
-            self._s
-            self._slayers
-        except:
-            self._s = list(self._padding)
-            # self._slayers = [list(self._padding) for slayer in self._slayers]
-            self._slayers = [list(self._padding) for l in set(self._ltypes.keys()) - 
-                             {'form', 'eot', 'nov', 'oov', 'eos', 'eod'}]
-            self._d_i = 0; self._s_i = 0
-            self._w_set = set(); self._ix = 0
-            self._novs, self._oovs, self._eoss, self._eods = self.index_documents(docs, modify_model = False)
-            self._d_ltypes, self._d_layers = self.build_layers(docs, covering, ltypes, layers)
 
         sampled = 0; talking = True
         while talking:
@@ -649,17 +674,18 @@ class LM(ABC):
             wi = len(self._s) - 1
             wis = [wi - wix for wix in range(len(self._whatevers)+1)]
             eot = self.sample_layer(self._s, 'eot', i = wis, seed = seed)[0] == "True"
-            P, _, _ = self.predict(self._s, wi, Td = Td + (Counter(self._s[:-1]) if resonant else Counter()), 
-                                   damping = damping, seed = seed, lays = self._slayers, ltys = self._ltypes)
+            P = self.predict(self._s, wi, Td = Td + (Counter(self._s[:-1]) if resonance else Counter()), 
+                             noise = noise, focus = focus, prose = prose, resonance = resonance, jargon = jargon,
+                             lays = self._slayers, ltys = self._ltypes)
             vec = -np.log10([P[t] for t in P]) - np.log10(len(P))
             ts, ps = map(np.array, zip(*P.most_common()))
-            if type(top) != int:
-                top = len(ps[ps[::-1].cumsum() <= top])
+            if type(top) == float:
+                top = len(ps) if top == 1.0 else len(ps[ps[::-1].cumsum() <= top])
             ts, ps = ts[:top], ps[:top]
             self._s[-1] = np.random.choice([t[0] for t in ts], size=None, replace=True, p=ps/ps.sum()) # note: there's no reason why whatever-type
             sampled += 1                                                                               # has to come before other layers, i.e., 
             w = self._s[-1]                                                                            # we can co-predict with layers, 
-                                                                                                       # or reverse prediction orders
+            print(w, end = '')                                                                         # or reverse prediction orders
             self.grok(wi, w, eot, w in self._w_set, (w, 'form') in self._T, vec, seed, pred_eos, pred_eod)
             if not self._whatevers: # just made a new token
                 if generate_next == 't':
