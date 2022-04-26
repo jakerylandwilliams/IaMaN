@@ -2,116 +2,79 @@ import re
 import scipy as sp
 import numpy as np
 import scipy.sparse
-from collections import Counter
+from collections import Counter, defaultdict
 
-def tokenize(text, space = True, wordchars = "a-zA-Z0-9-'"):
-    tokens = []
-    for token in re.split("(["+wordchars+"]+)", text):
-        if not space:
-            token = re.sub("[ ]+", "", token)
-        if not token:
-            continue
-        if re.search("["+wordchars+"]", token):
-            tokens.append(token)
-        else: 
-            tokens.extend(token)
-    return tokens
-
-def sentokenize(text, space = True, delims = ".?!\n|\t:", sentchars = "a-zA-Z0-9-'"): # harmonize with hr-bpe
-    sentences = []
-    
-    for chunk in re.split("(\s*(?<=["+delims+"][^"+sentchars+"])\s*)", text):
-        if (len(chunk)==1 and not re.search("["+sentchars+"]", chunk[0])):
-            if space or (chunk[0] != " "):
-                if len(sentences):
-                    sentences[-1] = sentences[-1] + [chunk]  
-                else:
-                    sentences.append([chunk])
-        elif not re.search("["+sentchars+"]", chunk):
-            tokens = tokenize(chunk, space = space)
-            if len(sentences):
-                sentences[-1] = sentences[-1] + tokens  
-            else:
-                sentences.append(tokens)
-        else:
-            sentences.append(tokenize(chunk, space = space))
-    
-    return sentences
-
-def make_TDM(documents, do_tfidf = True, space = True, normalize = True):
-    document_frequency = Counter()
-    for j, document in enumerate(documents):
-        frequency = Counter([t for s in sentokenize(document, space = space) 
-                         for t in s])
-        document_frequency += Counter(frequency.keys())
-    type_index = {t:i for i, t in enumerate(sorted(list(document_frequency.keys())))}
-    document_frequency = np.array(list(document_frequency.values()))
-    # performs the counting again, and stores with standardized indexing`
-    counts, row_ind, col_ind = map(np.array, zip(*[(count, type_index[t],j) 
-                                                   for j, document in enumerate(documents) 
-                                                   for t, count in Counter(tokenize(document, space = space)).items()]))
-    # constructs a sparse TDM from the indexed counts
-    TDM = sp.sparse.csr_matrix((counts, (row_ind, col_ind)),
-                             shape = (len(document_frequency),len(documents)))
-    if normalize:
-        # normalize frequency to be probabilistic
-        TDM = TDM.multiply(1/TDM.sum(axis = 0))
-    # apply tf-idf
-    if do_tfidf:
-        num_docs = TDM.shape[1]
-        IDF = -np.log2(document_frequency/num_docs)
-        TDM = (TDM.T.multiply(IDF)).T
-    return(TDM, type_index)
-
-def get_context(i, sentence, m = 20, positional = True, normed = False, lays = [], ltys = []):
-    locs = np.array(range(len(sentence))) - i
-    # dists = (lambda x: x-x[i])(np.cumsum(list(map(len, sentence))))
-    # mask = (locs != 0) & (np.abs(locs) <= m) if m else (locs != 0)
-    mask = (np.abs(locs) <= m) if m else np.array([True for loc in locs])
-    components = [np.concatenate([np.array(sentence)[mask]]+[np.array(l)[mask] for l in lays])]
+def get_context(i, sentence, m = 20, positional = True):
+    radii = range(-m,m+1); locs = range(i-m,i+m+1)
+    radii, locs = zip(*[(ra, lo) for ra, lo in zip(radii, locs) if lo >= 0 and lo < len(sentence)])
+    newcomponents = [np.concatenate([[sentence[lo] for lo in locs]])]
     if positional:
-        # if normed:
-        #     weights = np.array(list(dists[mask])*(len(ltys)+1))
-        # else:
-        #     weights = np.array(list(locs[mask])*(len(ltys)+1))
-        weights = np.array(list(locs[mask])*(len(ltys)+1))
-        components.append(weights)
-    components.append(['form']*len(locs[mask]) + [ltype for lt, l in zip(ltys, lays) 
-                                                  for ltype in [lt]*len(locs[mask])])
-    return(list(zip(*components)))
+        weights = np.array(list(radii))
+        newcomponents.append(weights)
+    newcomponents.append(['form']*len(locs))
+    return(list(zip(*newcomponents)))
 
-def make_CoM(documents, k = 20, gamma = 0, space = True, do_tficf = True, normalize = True):
-    document_frequency = Counter()
-    for j, document in enumerate(documents):
-        sentences = sentokenize(document, space = space)
-        documents[j] = sentences
-        frequency = Counter([t for s in documents[j] for t in s])
-        document_frequency += Counter(frequency.keys())
-    type_index = {t:i for i, t in enumerate(sorted(list(document_frequency.keys())))}
+def wave_index(stream, m = 0, seed = 0):
+    s = list(stream)
+    if seed:
+        ra.seed(seed)
+        ra.shuffle(s)
+    M = len(s) + m
+    indices = defaultdict(list)
+    T = np.arange(M)
+    f = Counter()
+    Nts = []
+    for i, w in enumerate(s):
+        f[w] += 1
+        indices[w].append(i + m)
+        Nts.append(len(f))
+    for w in indices:
+        indices[w] = np.array(indices[w])
+    indices[-1] = np.array(Nts)
+    f[''] = 1; M += 1
+    return indices, f, M, T
 
-    co_counts = Counter()  
-    for document in documents:
-        for sentence in document:
-            for i, ti in enumerate(sentence):
-                context, weights = get_context(i, sentence, k = k, gamma = gamma)        
-                for j, tj in enumerate(context):
-                    co_counts[(type_index[ti], type_index[tj])] += weights[j]
+def get_wave(w, idxs, f, M, T, accumulating = True, backward = False):
+    locs = np.zeros(len(T))
+    locs[idxs[w]] = 1
+    fts = np.cumsum(locs)
+    Mts = T+1
+    Nts = idxs[-1]
+    if accumulating:
+        wave = np.zeros(len(T))
+        prev_loc = -1
+        for Mt, ft, loc in zip(Mts[idxs[w]], fts[idxs[w]], idxs[w]):
+            if backward: loc = 0
+            delta = loc - prev_loc
+            alps = 2*np.pi*(T[loc:]*ft/Mt)
+            bet = 2*np.pi*((loc + 1)/(Mt/ft) - np.floor((loc + 1)/(Mt/ft)))
+            wave[loc:] += np.cos(alps + bet)*delta
+            prev_loc = loc
+            
+        if backward:
+            wave /= (sum(Nts)/len(f)) # maybe len(T), and not len(f)? nvm
+        else:
+            wave /= np.cumsum(Nts)
+    else: 
+        alpha = 2*np.pi*(T*f.get(w, f[''])/M)
+        betas = 2*np.pi*((idxs[w]+1)/(M/f.get(w, f[''])) - np.floor((idxs[w]+1)/(M/f.get(w, f['']))))
+        if backward:
+            wave = np.cos(alpha)*sum(np.cos(betas)) - np.sin(alpha)*sum(np.sin(betas))
+            wave /= len(f) # maybe len(T), and not len(f)? nvm
+        else:
+            deltas = np.array([idxs[w][0] + 1]+list(idxs[w][1:] - idxs[w][:-1]))
+            wave = np.zeros(len(T)) 
+            prev_loc = -1
+            for idxi, loc in enumerate(idxs[w]):
+                if prev_loc >= 0:
+                    bets = betas[:idxi]
+                    delts = deltas[-idxi:]
+                    wave[prev_loc:loc] = (np.cos(alpha[prev_loc:loc])*sum(np.cos(bets)*delts) - 
+                                          np.sin(alpha[prev_loc:loc])*sum(np.sin(bets)*delts))
+                prev_loc = loc
+            wave[prev_loc:] = (np.cos(alpha[prev_loc:])*sum(np.cos(betas)*deltas) - 
+                               np.sin(alpha[prev_loc:])*sum(np.sin(betas)*deltas))
+            wave /= (len(f)*Mts) # maybe len(T), and not len(f)? nvm
 
-    type_ijs, counts = zip(*co_counts.items())
-    row_ind, col_ind = zip(*type_ijs)
+    return wave/(f.get(w, f[''])*M)
 
-    # constructs a sparse CoM from the indexed counts
-    CoM = sp.sparse.csr_matrix((counts, (row_ind, col_ind)),
-                              shape = (len(type_index),len(type_index)))
-    if normalize:
-        # normalize frequency to be probabilistic
-        CoM = CoM.multiply(1/CoM.sum(axis = 0))
-    
-    # apply tf-icf
-    if do_tficf:
-        context_frequency = np.count_nonzero(CoM.toarray(), axis=1)
-        num_cons = CoM.shape[1]
-        ICF = -np.log2(context_frequency/num_cons)
-        CoM = (CoM.T.multiply(ICF)).T
-        
-    return CoM, type_index
