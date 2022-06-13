@@ -2,17 +2,17 @@ import re, json, os
 import numpy as np
 from collections import defaultdict
 
-def load_wikitext(v = "2", split = "train", num_articles = 10, seed = 691, all_articles = None):
+def load_wikitext(v = "2", split = "train", num_articles = 10, seed = 691, all_articles = None, rebuild = False, space = True):
     if all_articles is not None:
         articles = np.array(all_articles)
     else:
-        file_path = '/data/WikiText/wikitext-' + str(v) + '/wiki.' + split + '.articles.json'
-        if os.path.exists(file_path):
+        file_path = '/data/wikitext-' + str(v) + '/wiki.' + split + '.articles.json'
+        if os.path.exists(file_path) and not rebuild:
             articles = json.load(open(file_path))
         else:
             sec_title, sec_level = '', 0
             articles = []; article = {'title': '', 'text': '', 'document': [], 'sections': []}
-            for line in open('/data/WikiText/wikitext-' + str(v) + '/wiki.' + split + '.tokens'):
+            for line in open('/data/wikitext-' + str(v) + '/wiki.' + split + '.tokens'):
                 if re.search("^( =(?: =)* )([^=]+)(?: =(?: =)* )$", line):
                     level, title_text = re.search("^( =(?: =)* )([^=]+)(?: =(?: =)* )$", line).groups()
                     level = len(re.split("=", level)) - 1; title_text = title_text.strip()
@@ -26,8 +26,12 @@ def load_wikitext(v = "2", split = "train", num_articles = 10, seed = 691, all_a
                         sec_level = level
                 else:
                     if article['title'] and level and sec_title:
+                        line = line.strip(" ")
                         article['text'] += line
-                        article['document'].append([t for t in line.split(" ") if t])
+                        if space:
+                            article['document'].append([t for t in re.split("( )", line) if t])
+                        else:
+                            article['document'].append([t for t in re.split("([^ ]+| +[^ ]+)", line) if t])
                         article['sections'].append([sec_level, sec_title])
             if article['title']:
                 articles.append(article)
@@ -43,80 +47,7 @@ def load_wikitext(v = "2", split = "train", num_articles = 10, seed = 691, all_a
             
     return articles_sample
 
-def load_gum(num_articles = 10, seed = 691, all_articles = None, rebuild = False):
-    if all_articles is not None:
-        articles = np.array(all_articles)
-    else:
-        filenames = [x for x in os.listdir('/data/gum/gum-master/dep/') if 'conllu' in x]
-        articles = []
-        for filename in filenames:
-            
-            file_path = '/data/gum/gum-master/dep/' + re.sub(".conllu", "-articles.json", filename) 
-            if os.path.exists(file_path) and not rebuild:
-                path_articles = json.load(open(file_path))
-            else:
-                path_articles = []
-                article = {'id': '', 'title': '', 'text': '',
-                           'document': [], 'conllu': []}
-                parent_map = []
-                for line in open('/data/gum/gum-master/dep/' + filename):
-                    line = line.strip()
-                    if re.search("^# newdoc id = ", line):
-                        if article['id']:
-                            #for s_ix in range(len(article['conllu'])):
-                            #    for t_ix in range(len(article['conllu'][s_ix])):
-                            #        article['conllu'][s_ix][t_ix][0] = str(parent_map[s_ix][article['conllu'][s_ix][t_ix][0]])
-                            #        article['conllu'][s_ix][t_ix][-4] = str(parent_map[s_ix][article['conllu'][s_ix][t_ix][-4]])
-                            #        article['conllu'][s_ix][t_ix][-2] = "|".join([
-                            #            str(parent_map[s_ix][dep[:dep.index(":")]])+":"+dep[dep.index(":"):]
-                            #            for dep in article['conllu'][s_ix][t_ix][-2].split("|")])
-                            path_articles.append(article)
-                        article = {'id': line[14:],
-                                   'title': '', 'text': '', 
-                                   'document': [], 'conllu': []}
-                        parent_map = []
-                    if re.search("^# meta::title = ", line):
-                        article['title'] = line[16:]
-                    if re.search("^# sent_id = ", line):    
-                        article['document'].append([])
-                        article['conllu'].append([])
-                        parent_map.append({})
-                    if re.search("^# text = ", line):
-                        article['text'] += line[9:] + "\n"
-                    if re.search("^(\d+)\t([^\t]+)\t", line):
-                        row = re.split("\t", line)
-                        parent_map[-1][row[0]] = len(parent_map) + 1
-                        article['conllu'][-1].append(row)
-                        article['document'][-1].append(row[1])
-                        if 'SpaceAfter=No' not in row[-1]:
-                            parent_map[-1][row[0]+".1"] = parent_map[-1][row[0]]+1
-                            article['conllu'][-1].append([row[0]+".1", " ", " ", "PUNCT", 
-                                                          " ", "_", row[0], "punct", 
-                                                          row[0]+":punct", "_"])
-                            article['document'][-1].append(" ")
-                if article['id']:
-                    #for s_ix in range(len(article['conllu'])):
-                    #    for t_ix in range(len(article['conllu'][s_ix])):
-                    #        print(article['conllu'][s_ix])
-                    #        article['conllu'][s_ix][t_ix][0] = str(parent_map[s_ix][article['conllu'][s_ix][t_ix][0]])
-                    #        article['conllu'][s_ix][t_ix][-4] = str(parent_map[s_ix][article['conllu'][s_ix][t_ix][-4]])
-                    #        article['conllu'][s_ix][t_ix][-2] = "|".join([
-                    #            str(parent_map[s_ix][dep[:dep.index(":")]])+":"+dep[dep.index(":"):]
-                    #            for dep in article['conllu'][s_ix][t_ix][-2].split("|")])
-                    path_articles += [article]
-                with open(file_path, "w") as f:
-                    f.write(json.dumps(path_articles))
-            if path_articles:
-                articles += path_articles
-    if num_articles:
-        np.random.seed(seed)
-        articles_sample = np.random.choice(articles, size=num_articles, replace=False)
-    else:
-        articles_sample = np.array(articles)
-            
-    return articles_sample
-
-def load_ud(language, num_articles = 10, seed = 691, all_articles = None, rebuild = False, load_set = 'all'):
+def load_ud(language, num_articles = 10, seed = 691, all_articles = None, rebuild = False, load_set = 'all', space = True):
     available_languages = defaultdict(list)
     for ud_dir in os.listdir('/data/ud-treebanks-v2.9/'):
         if ud_dir[:3] == "UD_":
@@ -150,7 +81,9 @@ def load_ud(language, num_articles = 10, seed = 691, all_articles = None, rebuil
                         if re.search("^# newdoc id = ", line):
                             doc_id = line[14:]+"-"+set_name+"-"+filename[:-7]
                             if article['id']:
-                                article['text'] = "".join([t for s in article['document'] for t in s])
+                                article['document'] = [list(s[:-1]+[s[-1]+" "]) for s in article['document']]
+                                article['text'] = [t for s in article['document'] for t in s]
+                                article['text'] = ''.join(article['text'])
                                 newconllu = []
                                 for s_i in range(len(article['conllu'])):
                                     newconllu.append([])
@@ -161,8 +94,18 @@ def load_ud(language, num_articles = 10, seed = 691, all_articles = None, rebuil
                                         newrow[8] = re.sub("^\d+", idx_map[s_i][article['conllu'][s_i][wi][6]], 
                                                            article['conllu'][s_i][wi][8])
                                         newconllu[-1].append(newrow)
+                                    if space:
+                                        newconllu[-1].append([str(int(newconllu[-1][-1][0])+1), ' ', ' ', 'SPACE', 
+                                                              ' ', '_', newconllu[-1][-1][0], 'space', 
+                                                              newconllu[-1][-1][0]+':space', '_'])
+                                    else:
+                                        newconllu[-1][-1][1] = newconllu[-1][-1][1] + ' '
+                                    # if not space:
+                                    #     newconllu[-1][0][1] = newconllu[-1][0][1].lstrip(' ')
+                                    article['text'] = article['text'] + ' '
                                 article['conllu'] = list(newconllu)
                                 path_articles.append(article)
+                            extra_space = tuple()
                             article = {'id': doc_id,
                                        'title': '', 'text': '', 
                                        'document': [], 'conllu': [], 's_type': []}
@@ -170,10 +113,11 @@ def load_ud(language, num_articles = 10, seed = 691, all_articles = None, rebuil
                         if re.search("^# meta::title = ", line) and doc_id:
                             article['title'] = line[16:]
                         if re.search("^# sent_id = ", line):
-                            extra_space = tuple()
                             if not doc_id:
                                 if article['id']:
-                                    article['text'] = "".join([t for s in article['document'] for t in s])
+                                    article['document'] = [list(s[:-1]+[s[-1]+" "]) for s in article['document']]
+                                    article['text'] = [t for s in article['document'] for t in s]
+                                    article['text'] = ''.join(article['text'])
                                     newconllu = []
                                     for s_i in range(len(article['conllu'])):
                                         newconllu.append([])
@@ -184,12 +128,21 @@ def load_ud(language, num_articles = 10, seed = 691, all_articles = None, rebuil
                                             newrow[8] = re.sub("^\d+", idx_map[s_i][article['conllu'][s_i][wi][6]], 
                                                                article['conllu'][s_i][wi][8])
                                             newconllu[-1].append(newrow)
+                                        if space:
+                                            newconllu[-1].append([str(int(newconllu[-1][-1][0])+1), ' ', ' ', 'SPACE', 
+                                                                  ' ', '_', newconllu[-1][-1][0], 'space', 
+                                                                  newconllu[-1][-1][0]+':space', '_'])
+                                        else:
+                                            newconllu[-1][-1][1] = newconllu[-1][-1][1] + ' '
+                                    # if not space:
+                                    #     newconllu[-1][0][1] = newconllu[-1][0][1].lstrip(' ')
                                     article['conllu'] = list(newconllu)
                                     path_articles.append(article)
                                 article = {'id': line[11:]+"-"+set_name+"-"+filename[:-7], 
                                            'title': '', 'text': '', 
                                            'document': [], 'conllu': [], 's_type': []}
                                 idx_map = []
+                            extra_space = tuple()
                             article['document'].append([])
                             article['conllu'].append([])
                             idx_map.append({'0': '0'})
@@ -219,28 +172,29 @@ def load_ud(language, num_articles = 10, seed = 691, all_articles = None, rebuil
                                         if len(constituent_chunk) == len(row[1]): break
                                     contraction_form = contraction_form[len(constituent_chunk):]
                                 row[1] = constituent_chunk
-                            if extra_space:
+                            if extra_space and space:
                                 idx_map[-1][extra_space[0][0]] = str(len(idx_map[-1]))
                                 article['conllu'][-1].append(extra_space[0])
                                 article['document'][-1].append(extra_space[1])
                                 extra_space = tuple()
-                            elif not article['document'][-1]:
-                                extra_space = (["0.1", " ", " ", "PUNCT", " ", "_", "1", "punct", "1:punct", "_"], " ")
+                            elif (not article['document'][-1]) and space: # this one prepends the sentence with a space
+                                extra_space = (["0.1", " ", " ", "SPACE", " ", "_", "1", "space", "1:space", "_"], " ")
                                 idx_map[-1]['0.1'] = str(len(idx_map[-1]))
                                 article['conllu'][-1].append(extra_space[0])
                                 article['document'][-1].append(extra_space[1])
                                 extra_space = tuple()
+                            elif space:
+                                extra_space = tuple()
                             idx_map[-1][row[0]] = str(len(idx_map[-1]))
                             article['conllu'][-1].append(row)
                             article['document'][-1].append(row[1])
+                            if extra_space and not space:
+                                article['conllu'][-1][-1][1] = " " + article['conllu'][-1][-1][1]
+                                article['document'][-1][-1] = " " + article['document'][-1][-1]
+                                extra_space = tuple()
                             if 'SpaceAfter=No' not in row[-1] and not contraction_form:
-                                extra_space = ([row[0]+".1", " ", " ", "PUNCT", " ", "_", str(int(row[0])+1), "punct", 
-                                                row[0]+":punct", "_"], " ")
-                                # idx_map[-1][row[0]+".1"] = str(len(idx_map[-1]))
-                                # article['conllu'][-1].append([row[0]+".1", " ", " ", "PUNCT", 
-                                #                               " ", "_", row[0], "punct", 
-                                #                               row[0]+":punct", "_"])
-                                # article['document'][-1].append(" ")
+                                extra_space = ([row[0]+".1", " ", " ", "SPACE", " ", "_", str(int(row[0])+1), "space", 
+                                                row[0]+":space", "_"], " ")
                         elif re.search("^(\d+-\d+)\t([^\t]+)\t", line):
                             row = re.split("\t", line)
                             contracted_range = list(map(int, row[0].split('-')))
@@ -250,7 +204,9 @@ def load_ud(language, num_articles = 10, seed = 691, all_articles = None, rebuil
                             contraction_form = ""
                             
                     if article['id']:
-                        article['text'] = "".join([t for s in article['document'] for t in s])
+                        article['document'] = [list(s[:-1]+[s[-1]+" "]) for s in article['document']]
+                        article['text'] = [t for s in article['document'] for t in s]
+                        article['text'] = ''.join(article['text'])
                         newconllu = []
                         for s_i in range(len(article['conllu'])):
                             newconllu.append([])
@@ -261,6 +217,14 @@ def load_ud(language, num_articles = 10, seed = 691, all_articles = None, rebuil
                                 newrow[8] = re.sub("^\d+", idx_map[s_i][article['conllu'][s_i][wi][6]], 
                                                    article['conllu'][s_i][wi][8])
                                 newconllu[-1].append(newrow)
+                            if space:
+                                newconllu[-1].append([str(int(newconllu[-1][-1][0])+1), ' ', ' ', 'SPACE', 
+                                                      ' ', '_', newconllu[-1][-1][0], 'space', 
+                                                      newconllu[-1][-1][0]+':space', '_'])
+                            else:
+                                newconllu[-1][-1][1] = newconllu[-1][-1][1] + ' '
+                        # if not space:
+                        #     newconllu[-1][0][1] = newconllu[-1][0][1].lstrip(' ')
                         article['conllu'] = list(newconllu)
                         path_articles += [article]
                     with open(file_path, "w") as f:

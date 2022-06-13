@@ -4,15 +4,17 @@ import numpy as np
 import scipy.sparse
 from collections import Counter, defaultdict
 
-def get_context(i, sentence, m = 20, positional = True):
+def get_context(i, sentence, m = 20):
     radii = range(-m,m+1); locs = range(i-m,i+m+1)
-    radii, locs = zip(*[(ra, lo) for ra, lo in zip(radii, locs) if lo >= 0 and lo < len(sentence)])
-    newcomponents = [np.concatenate([[sentence[lo] for lo in locs]])]
-    if positional:
+    components = [(ra, lo) for ra, lo in zip(radii, locs) 
+                  if lo >= 0 and lo < len(sentence)] # and sentence[lo]
+    if components:
+        radii, locs = zip(*components)
+        components = [np.concatenate([[sentence[lo] for lo in locs]])]
         weights = np.array(list(radii))
-        newcomponents.append(weights)
-    newcomponents.append(['form']*len(locs))
-    return(list(zip(*newcomponents)))
+        components.append(weights)
+        components.append(['form']*len(locs))
+    return(list(zip(*components)))
 
 def wave_index(stream, m = 0, seed = 0):
     s = list(stream)

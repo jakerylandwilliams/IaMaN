@@ -3,7 +3,7 @@ import numpy as np
 from functools import reduce
 import multiprocessing
 from .fnlp import get_context
-import json
+import json, torch
 
 def build_layers(d, covering, ltypes, layers):
     temp_ltypes = []
@@ -26,12 +26,13 @@ def build_layers(d, covering, ltypes, layers):
 def build_document(d, ltypes, layers):
     meta = {'Tds': [Counter()], 'total_sentences': len(d), 'M': 0,
             'alphas': defaultdict(list), 'Tls': [defaultdict(lambda : defaultdict(Counter))],
-            'L': defaultdict(lambda : defaultdict(set))}
+            'L': defaultdict(lambda : defaultdict(set)), 'f0': Counter()}
     delta = 0; s_j = 0
     nvs, ess, eds = [], [], []
     for s_j, s in enumerate(d):
         nvs.append([]); ess.append([]); eds.append([])
         for i, t in enumerate(list(s)):
+            meta['f0'][t] += 1
             eds[-1].append(False)
             if i == len(s) - 1:
                 ess[-1].append(True)
@@ -59,11 +60,30 @@ def build_document(d, ltypes, layers):
     return nvs, ess, eds, meta
 
 def build_eots(d, covering):
-    ets = []
+    eots = []
     for c_s, s in zip(covering, d):
+        locs = np.cumsum(list(map(len, s)))
         c_locs = np.cumsum(list(map(len, c_s)))
-        ets.append([loc in c_locs for loc in np.cumsum(list(map(len, s)))])
-    return ets    
+        eots.append([loc in c_locs for loc in locs])
+    return eots
+
+def build_bots(d, covering):
+    bots = []
+    for c_s, s in zip(covering, d):
+        locs = np.cumsum(list(map(len, s))) - len(s[0])
+        c_locs = np.cumsum(list(map(len, c_s))) - len(c_s[0])
+        bots.append([loc in c_locs for loc in locs])
+    return bots
+
+def build_iats(d, covering):
+    iats = []
+    for c_s, s in zip(covering, d):
+        locs = np.array([0] + list(np.cumsum(list(map(len, s)))))
+        spns = set(list(zip(locs[:-1], locs[1:])))
+        c_locs = np.array([0] + list(np.cumsum(list(map(len, c_s)))))
+        c_spns = set(list(zip(c_locs[:-1], c_locs[1:])))
+        iats.append([spn in c_spns for spn in sorted(spns)])
+    return iats
 
 def process_document(x): 
     doc, covering, ltypes, layers = x
@@ -78,9 +98,9 @@ def process_document(x):
     # if there was a covering, fit the model to its segmentation (end of token prediction)
     # as well as any other cover layers (POS, etc.) onto the end of token-positioned whatevers
     if covering:
-        ets = build_eots(d, covering)
-        layers = layers + [nvs, ets, ess, eds]
-        ltypes = ltypes + ['nov', 'eot', 'eos', 'eod']
+        its = build_iats(d, covering); bts = build_bots(d, covering); ets = build_eots(d, covering)
+        layers = layers + [nvs, its, bts, ets, ess, eds]
+        ltypes = ltypes + ['nov', 'iat', 'bot', 'eot', 'eos', 'eod']
         ## replacing # meta['max_sent'] = max([max([sum(s) for s in ets]), self._max_sent])
         meta['max_sent'] = max([sum(s) for s in ets]) 
         ##
@@ -89,7 +109,7 @@ def process_document(x):
         ltypes = ltypes + ['nov', 'eos', 'eod']
         meta['max_sent'] = 0
     meta['lorder'] = list(ltypes)
-
+    
     return d, layers, ltypes, meta
 
 def count(x, bc = {}):
@@ -104,23 +124,25 @@ def count(x, bc = {}):
     ltypes, layers = build_layers(d, covering, ltypes, layers)
     nvs, ess, eds, meta = build_document(d, ltypes, layers)
     if covering:
-        ets = build_eots(d, covering)
-        layers = layers + [nvs, ets, ess, eds]
-        ltypes = ltypes + ['nov', 'eot', 'eos', 'eod']
+        its = build_iats(d, covering); bts = build_bots(d, covering); ets = build_eots(d, covering)
+        layers = layers + [nvs, its, bts, ets, ess, eds]
+        ltypes = ltypes + ['nov', 'iat', 'bot', 'eot', 'eos', 'eod']
         meta['max_sent'] = max([sum(s) for s in ets])
     else:
         layers = layers + [nvs, ess, eds]
         ltypes = ltypes + ['nov', 'eos', 'eod']
         meta['max_sent'] = 0
     meta['lorder'] = list(ltypes)
-    print(ltypes)
     ##
     ## replacing: doc_Fs = [self.count(d, old_ife = old_ife)]
     yield from Counter([((t,'form'), c) 
                         for s in [[t_s for ds in d for t_s in ds]] for i, t in enumerate(s)
-                        for c in get_context(i,  list(s), m = bc['m'], positional = bc['positional']) ###
+                        for c in get_context(i,  list(s), m = bc['m']) 
                         if ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife'])))]).items()
-            
+    yield from Counter([((t,'form'), tuple([str(c[1]), c[1], 'attn'])) # c
+                        for s in [[t_s for ds in d for t_s in ds]] for i, t in enumerate(s)
+                        for c in get_context(i,  list(s), m = bc['m']) 
+                        if ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife'])))]).items()
     ##
     ## replacing: for ltype, layer_Fs in self.count_layers(d, layers = layers, ltypes = ltypes, old_ife = old_ife): doc_Fs.append(layer_Fs)
     for layer, ltype in zip(layers, ltypes):
@@ -128,8 +150,15 @@ def count(x, bc = {}):
         yield from Counter([((l,ltype), c) 
                             for s, s_l in [list(zip(*[(t_s, t_l) for ds, ds_l in zip(d, layer) for t_s, t_l in zip(ds, ds_l)]))]
                             for i, (t, l) in enumerate(list(zip(s,s_l)))
-                            for c in get_context(i,  list(s), m = bc['m'], positional = bc['positional']) ###
+                            for c in get_context(i,  list(s), m = bc['m']) 
                             if ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife'])))]).items()
+        ## accrue data for positional distributions
+        yield from Counter([((l,ltype), tuple([str(c[1]), c[1], 'attn'])) # c
+                            for s, s_l in [list(zip(*[(t_s, t_l) for ds, ds_l in zip(d, layer) for t_s, t_l in zip(ds, ds_l)]))]
+                            for i, (t, l) in enumerate(list(zip(s,s_l)))
+                            for c in get_context(i,  list(s_l), m = bc['m']) # note s_l, not l!
+                            if ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife'])))]).items()
+        ##
     ##
 
 def aggregate_processed(a, b): # a/b = (Fs, meta)
@@ -151,4 +180,10 @@ def aggregate_processed(a, b): # a/b = (Fs, meta)
             'Tds': a['Tds'] + b['Tds'],
             'Tls': a['Tls'] + b['Tls'], 'L': L,
             'max_sent': max([a['max_sent'], b['max_sent']]),
-            'lorder': lorder})
+            'lorder': lorder,
+            'f0': a['f0'] + b['f0']})
+
+def to_gpu(x):
+    if torch.cuda.is_available():
+        return x.to('cuda')
+    return x.to('cpu')
