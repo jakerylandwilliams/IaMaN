@@ -6,13 +6,13 @@ def load_wikitext(v = "2", split = "train", num_articles = 10, seed = 691, all_a
     if all_articles is not None:
         articles = np.array(all_articles)
     else:
-        file_path = '/data/wikitext-' + str(v) + '/wiki.' + split + '.articles.json'
+        file_path = '/local-data/wikitext-' + str(v) + '/wiki.' + split + '.articles.json'
         if os.path.exists(file_path) and not rebuild:
             articles = json.load(open(file_path))
         else:
             sec_title, sec_level = '', 0
             articles = []; article = {'title': '', 'text': '', 'document': [], 'sections': []}
-            for line in open('/data/wikitext-' + str(v) + '/wiki.' + split + '.tokens'):
+            for line in open('/local-data/wikitext-' + str(v) + '/wiki.' + split + '.tokens'):
                 if re.search("^( =(?: =)* )([^=]+)(?: =(?: =)* )$", line):
                     level, title_text = re.search("^( =(?: =)* )([^=]+)(?: =(?: =)* )$", line).groups()
                     level = len(re.split("=", level)) - 1; title_text = title_text.strip()
@@ -49,7 +49,7 @@ def load_wikitext(v = "2", split = "train", num_articles = 10, seed = 691, all_a
 
 def load_ud(language, num_articles = 10, seed = 691, all_articles = None, rebuild = False, load_set = 'all', space = True):
     available_languages = defaultdict(list)
-    for ud_dir in os.listdir('/data/ud-treebanks-v2.9/'):
+    for ud_dir in os.listdir('/local-data/UD/ud-treebanks-v2.9/'):
         if ud_dir[:3] == "UD_":
             lang, set_name = ud_dir[3:].split('-')
             available_languages[lang].append(set_name)
@@ -65,9 +65,9 @@ def load_ud(language, num_articles = 10, seed = 691, all_articles = None, rebuil
     else:
         articles = []; extra_space = tuple()
         for set_name in load_sets:
-            filenames = [x for x in os.listdir(f"/data/ud-treebanks-v2.9/UD_{language}-{set_name}/") if 'conllu' in x]
+            filenames = [x for x in os.listdir(f"/local-data/UD/ud-treebanks-v2.9/UD_{language}-{set_name}/") if 'conllu' in x]
             for filename in filenames:
-                file_path = (f"/data/ud-treebanks-v2.9/UD_{language}-{set_name}/" + 
+                file_path = (f"/local-data/UD/ud-treebanks-v2.9/UD_{language}-{set_name}/" + 
                              re.sub(".conllu", "-articles.json", filename)) 
                 if os.path.exists(file_path) and not rebuild:
                     path_articles = json.load(open(file_path))
@@ -76,7 +76,7 @@ def load_ud(language, num_articles = 10, seed = 691, all_articles = None, rebuil
                     article = {'id': '', 'title': '', 'text': '',
                                'document': [], 'conllu': [], 's_type': []}
                     idx_map = []; contracted_range = []; contraction_form = ""
-                    for line in open(f"/data/ud-treebanks-v2.9/UD_{language}-{set_name}/" + filename):
+                    for line in open(f"/local-data/UD/ud-treebanks-v2.9/UD_{language}-{set_name}/" + filename):
                         line = line.strip()
                         if re.search("^# newdoc id = ", line):
                             doc_id = line[14:]+"-"+set_name+"-"+filename[:-7]

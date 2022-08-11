@@ -85,7 +85,9 @@ def build_iats(d, covering):
         iats.append([spn in c_spns for spn in sorted(spns)])
     return iats
 
-def process_document(x): 
+def process_document(x, bc = {}): 
+    if not type(bc) == dict: # this allows the function to access broadcast variables through spark
+        bc = dict(bc.value)
     doc, covering, ltypes, layers = x
     # tokenize the document (note: currently the tokenizer is non-serializable, and should be a broadcast variable, too!)
 #     d = [self.tokenizer.tokenize(s) for s in doc]
@@ -109,8 +111,10 @@ def process_document(x):
         ltypes = ltypes + ['nov', 'eos', 'eod']
         meta['max_sent'] = 0
     meta['lorder'] = list(ltypes)
-    
-    return d, layers, ltypes, meta
+    dcon = [[c for c in get_context(i, list(unroll(d)), m = bc['m']) 
+             if (bc['pre_train'] and ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife']))))
+             or not bc['pre_train']] for i, t in enumerate(unroll(d))]
+    return d, dcon, layers, ltypes, meta
 
 def count(x, bc = {}):
     if not type(bc) == dict: # this allows the function to access broadcast variables through spark
@@ -138,11 +142,13 @@ def count(x, bc = {}):
     yield from Counter([((t,'form'), c) 
                         for s in [[t_s for ds in d for t_s in ds]] for i, t in enumerate(s)
                         for c in get_context(i,  list(s), m = bc['m']) 
-                        if ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife'])))]).items()
+                        if (bc['pre_train'] and ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife']))))
+                        or not bc['pre_train']]).items()
     yield from Counter([((t,'form'), tuple([str(c[1]), c[1], 'attn'])) # c
                         for s in [[t_s for ds in d for t_s in ds]] for i, t in enumerate(s)
                         for c in get_context(i,  list(s), m = bc['m']) 
-                        if ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife'])))]).items()
+                        if (bc['pre_train'] and ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife']))))
+                        or not bc['pre_train']]).items()
     ##
     ## replacing: for ltype, layer_Fs in self.count_layers(d, layers = layers, ltypes = ltypes, old_ife = old_ife): doc_Fs.append(layer_Fs)
     for layer, ltype in zip(layers, ltypes):
@@ -151,13 +157,15 @@ def count(x, bc = {}):
                             for s, s_l in [list(zip(*[(t_s, t_l) for ds, ds_l in zip(d, layer) for t_s, t_l in zip(ds, ds_l)]))]
                             for i, (t, l) in enumerate(list(zip(s,s_l)))
                             for c in get_context(i,  list(s), m = bc['m']) 
-                            if ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife'])))]).items()
+                            if (bc['pre_train'] and ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife']))))
+                            or not bc['pre_train']]).items()
         ## accrue data for positional distributions
         yield from Counter([((l,ltype), tuple([str(c[1]), c[1], 'attn'])) # c
                             for s, s_l in [list(zip(*[(t_s, t_l) for ds, ds_l in zip(d, layer) for t_s, t_l in zip(ds, ds_l)]))]
                             for i, (t, l) in enumerate(list(zip(s,s_l)))
                             for c in get_context(i,  list(s_l), m = bc['m']) # note s_l, not l!
-                            if ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife'])))]).items()
+                            if (bc['pre_train'] and ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife']))))
+                            or not bc['pre_train']]).items()
         ##
     ##
 
@@ -187,3 +195,36 @@ def to_gpu(x):
     if torch.cuda.is_available():
         return x.to('cuda')
     return x.to('cpu')
+
+def detach(x):
+    if type(x) == torch.Tensor:
+        x = x.clone().detach().cpu()
+    return np.array(x)
+
+def unroll(d):
+    return [t for s in d for t in s]
+
+class data_streams(torch.utils.data.Dataset):
+    # A PyTorch Dataset wrapper for encoded data streams!
+    # encoded = a dict of lists of integer-encoded layers, m = the context-window size
+    def __init__(self, encoded, m): 
+        self._data = encoded; self._m = m
+        # setting pad to max sequence length
+        # self._pad_length = max([len(stream['cons']) for stream in encoded])
+        # self._data = []; self.load(encoded)
+    def __len__(self):
+        return len(self._data)
+    def __getitem__(self, i):
+        # data are encoded layers, i.e., padded parallel lists of indices
+        return self._data[i] # = {'form': doc_indices, 'tag': tag_indices, ...} 
+    def load(self, encoded):
+        for i, stream in enumerate(encoded):
+            self._data.append(dict(stream))
+            padding = [0] * (self._pad_length - len(stream['cons']))
+            cons_padding = list([0] * (2*self._m + 1)) * (self._pad_length - len(stream['cons']))
+            for ltype in self._data[-1]:
+                # 'cons' and 'amps' layers are 2d for contexts and positional weighting
+                if ltype == 'cons' or ltype == 'amps':
+                    self._data[-1][ltype] += cons_padding
+                else:
+                    self._data[-1][ltype] += padding

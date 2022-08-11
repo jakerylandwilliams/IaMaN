@@ -12,7 +12,6 @@ class Whatever:
         self._nrm = int(nrm) if nrm is not None else 1
         self._atn = float(atn) if atn is not None else 1.
         self._vec = np.array(vec) if vec is not None else None
-        
     def __str__(self):
         return self._form
     def __repr__(self):
@@ -64,3 +63,92 @@ class Document(Sentence):
         super(Document, self).__init__([t for s in sentences for t in s._tokens], ix = ix, 
                                        nrm = nrm, atn = atn, vec = vec)
         self._sentences = list(sentences)
+        
+# I know these things are usually called vocabularies, i.e. we define `class Vocab:`,
+class Vocab: # but since what they do is encode, wouldn't it be more descriptive to define them as `class Code:`?
+    # Class that handles mapping to and from whatever to vocab indices
+    def __init__(self, whatevers, null = None):
+        self._type_index = {}; self._index_type = {}
+        self.train(whatevers)
+        self._null = null
+        
+    def train(self, whatevers):
+        # generate vocab list
+        for whatever in whatevers:
+            if whatever not in self._type_index:
+                self._type_index[whatever] = len(self._type_index)
+        # build reverse lookup
+        self._index_type = {i: whatever for whatever, i in self._type_index.items()}
+        
+    def encode(self, whatever):
+        # return self._type_index.get(whatever, 0)
+        return self._type_index.get(whatever, 0 if self._null is None else
+                                    self._type_index[(self._null, whatever[1], whatever[2])])
+    
+    def decode(self, i):
+        return self._index_type.get(i, self._index_type[0])
+    
+    def __iter__(self):
+        return (self._index_type[i] for i in self._index_type)
+    
+    def __len__(self):
+        return len(self._type_index)
+    
+    def __getitem__(self, i):
+        return self._index_type[i]
+    
+# this differentes the concept of a Code (vocabs and 1-hot encodings), which are used for indexing types; 
+# with a Cipher, which entails dimensionality reduction and compression (SVD; IFEncipherment, nee Encoding).
+# the cool thing (technically), is that this Cipher generalizes to 1-hot encoding when bits = len(self._vocab) ;)
+# does this mean that every Cipher is a Code? as conceived, a Cipher is 'fuzzy', while a Code is exact.
+# note: we're probably stomping on disciplinary terminology, and better terms may exist.
+class Cipher:
+    def __init__(self, vocab, bits = None):
+        self._vocab = vocab
+        self._bits = (int(np.log2(len(self._vocab)) + 1) if bits is None else 
+                      (int(bits) if 2**int(bits) > len(self._vocab) else 
+                       int(np.log2(len(self._vocab)) + 1)))
+        self._basis = list(np.eye(self._bits))
+        self._type_index = {}; self._index_type = {}; self._vs = [[np.zeros(self._bits)], []]
+        self._sparse_index = {}; self._sparse_types = {}
+        self._U = np.zeros((len(self._vocab), self._bits))
+        self._V = np.zeros((len(self._vocab), self._bits))
+        self._i = 0; self._j = 0; self._k = len(self._vs) - 1
+        self.train()
+        
+    def train(self):
+        for w in self._vocab:
+            v, idx = self.update(w)
+            self._sparse_types[idx] = w
+            self._sparse_index[w] = idx
+            self._V[self._type_index[w],:] = v/v.sum()
+            self._U[self._type_index[w],:] = v
+                    
+    def update(self, w):
+        enciphered = False
+        while not enciphered:
+            v = np.abs(self._vs[self._k-1][self._j] - self._basis[self._i])
+            idx = tuple(np.arange(v.shape[0])[v != 0])
+            if len(idx) == self._k and idx not in self._sparse_types:
+                self._type_index[w] = len(self._type_index)
+                self._index_type[self._type_index[w]] = w
+                self._vs[self._k].append(v)
+                enciphered = True
+            self._j += 1
+            if self._j == len(self._vs[self._k-1]):
+                self._j = 0; self._i += 1
+                if self._i == len(self._basis):
+                    if self._k == 1: self._basis.reverse()
+                    self._i = 0; self._k += 1
+                    self._vs[-1].reverse(); self._vs.append([])
+        return v, idx
+
+    def encipher(self, w):
+        return np.array(self._V[self._type_index[w],:]) if w in self._type_index else np.array(self._vs[0][0])
+    
+    def decipher(self, v):
+        return self._index_type.get(self._U.dot(v).argmax(), '')
+    
+    def sparse_encipher(self, w):
+        return np.array(self._sparse_index[w]) if w in self._type_index else np.array([])
+        

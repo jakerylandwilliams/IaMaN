@@ -5,7 +5,7 @@ import torch
 # produces a vector sequence for viterbi decoding at the appropriate tag (sep-indicated) level
 # for example: record the locations of whatevers within tokens and aggregate the token vectors
 def agg_vecs(vecs, atns, seps, nrms = []):
-    if not nrms: nrms = [1 for _ in atns]
+    if not len(nrms): nrms = [1 for _ in atns]
     tvecs, tnrms, tatns = [], [], []
     aggvecs, aggnrms, aggatns = [], [], []
     for vec, nrm, atn, sep in zip(vecs, nrms, atns, seps):
@@ -14,7 +14,7 @@ def agg_vecs(vecs, atns, seps, nrms = []):
             aggnrm = sum(aggnrms)
             aggatn = sum(aggatns)
             if type(aggvecs[0]) == torch.Tensor:
-                aggvec = (aggnrm/aggatn)*torch.stack(aggvecs).T.inner(torch.tensor(aggatns))
+                aggvec = (aggnrm/aggatn)*torch.stack(aggvecs).T.matmul(torch.tensor(aggatns, dtype = torch.double)) # , device = torch.cuda.current_device()
             else:
                 aggvec = (aggnrm/aggatn)*np.array(aggvecs).T.dot(aggatns)
             tvecs.append(aggvec); tnrms.append(aggnrm); tatns.append(aggatn)
@@ -23,7 +23,7 @@ def agg_vecs(vecs, atns, seps, nrms = []):
         aggnrm = sum(aggnrms)
         aggatn = sum(aggatns)
         if type(aggvecs[0]) == torch.Tensor:
-            aggvec = (aggnrm/aggatn)*torch.stack(aggvecs).T.inner(torch.tensor(aggatns))
+            aggvec = (aggnrm/aggatn)*torch.stack(aggvecs).T.matmul(torch.tensor(aggatns, dtype = torch.double)) # , device = torch.cuda.current_device()
         else:
             aggvec = (aggnrm/aggatn)*np.array(aggvecs).T.dot(aggatns)
         tvecs.append(aggvec); tnrms.append(aggnrm); tatns.append(aggatn)
@@ -33,7 +33,7 @@ def agg_vecs(vecs, atns, seps, nrms = []):
         if sep:
             aixs.append(ixs)
             ixs = []
-    return tvecs, tnrms, tatns, aixs
+    return tvecs, tnrms, tatns, aixs        
 
 def blend_predictions(P1, P2, transfer_p, mean = 'arithmetic'):
     if mean == 'geometric':
