@@ -5,6 +5,14 @@ import multiprocessing
 from .fnlp import get_context
 import json, torch
 
+# purpose: aligns lists of tags to a sequence of whatevers, according to a covering (gold tokenization)
+# arguments:
+# - d: list (document) of lists (sentences) of strings (whatevers) representing a (rolled) document 
+# - covering: list (document) of lists (sentences) of strings (tokens) representing a 'gold standard' tokenization for the document
+# - ltypes: list (layer types) of strings (layer type names) representing the types of layers to be aligned
+# - layers: list (layer types) of lists (document layers) of lists (sentence layers) of strings (tags) aligned to d's order
+# prereqs:  d and covering must join to the same string, that is: assert "".join(d) == "".join(covering)
+# output: updated versions of ltypes and layers, aligned the the sequence structure of the document's (d's) underlying tokenization
 def build_layers(d, covering, ltypes, layers):
     temp_ltypes = []
     temp_layers = []
@@ -23,6 +31,17 @@ def build_layers(d, covering, ltypes, layers):
     layers = list(temp_layers); del(temp_layers)
     return ltypes, layers
 
+# purpose: process a document (a sequence of whatevers) for its generative statistics and align them for sequence learning
+# arguments:
+# - d: list (document) of lists (sentences) of strings (whatevers) representing a (rolled) document 
+# - ltypes: list (layer types) of strings (layer type names) representing the types of layers to be aligned
+# - layers: list (layer types) of lists (document layers) of lists (sentence layers) of strings (tags) aligned to d's order
+# prereqs: ltypes and layers should first be processed by build_layers for alignment to d
+# output: 
+# - nvs: list (document) of lists (sentences) of booleans (novelties) representing the introduction of whatevers to the document
+# - ess: list (document) of lists (sentences) of booleans (end of sentence signatures) representing the whatevers that ended sentences
+# - eds: list (document) of lists (sentences) of booleans (end of document signatures) representing the whatevers that ended documents
+# - meta: dict of complex metadata, structured for distributed aggregation, representing the document's individual frequency distribution ('Tds'), it's 'total_sentences', it's length in total number of whatevers ('M'), it's sequential novelty rate ('alphas'), the document's frequency distributions of layers ('Tls'), the sets of tags found in the document's layers ('L'), and a copy of the document's frequency distribution for aggregation with others (downstream in processing).
 def build_document(d, ltypes, layers):
     meta = {'Tds': [Counter()], 'total_sentences': len(d), 'M': 0,
             'alphas': defaultdict(list), 'Tls': [defaultdict(lambda : defaultdict(Counter))],
@@ -59,6 +78,13 @@ def build_document(d, ltypes, layers):
     meta['L'] = dict(meta['L'])
     return nvs, ess, eds, meta
 
+# purpose: process a covering (gold standard tokenization) for a boolean layer representing whatevers that end tokens
+# arguments:
+# - d: see build_layers
+# - covering: see build_layers
+# prereqs: d and covering must join to the same string, that is: assert "".join(d) == "".join(covering)
+# output: 
+# - eots: list (document) of lists (sentences) of booleans (end of token signatures) representing the whatevers that ended tokens
 def build_eots(d, covering):
     eots = []
     for c_s, s in zip(covering, d):
@@ -67,6 +93,13 @@ def build_eots(d, covering):
         eots.append([loc in c_locs for loc in locs])
     return eots
 
+# purpose: process a covering (gold standard tokenization) for a boolean layer representing whatevers that begin tokens
+# arguments:
+# - d: see build_layers
+# - covering: see build_layers
+# prereqs: d and covering must join to the same string, that is: assert "".join(d) == "".join(covering)
+# output:
+# - bots: list (document) of lists (sentences) of booleans (beginning of token signatures) representing the whatevers that began tokens
 def build_bots(d, covering):
     bots = []
     for c_s, s in zip(covering, d):
@@ -75,6 +108,13 @@ def build_bots(d, covering):
         bots.append([loc in c_locs for loc in locs])
     return bots
 
+# purpose: process a covering (gold standard tokenization) for a boolean layer representing whatevers that are tokens
+# arguments:
+# - d: see build_layers
+# - covering: see build_layers
+# prereqs: d and covering must join to the same string, that is: assert "".join(d) == "".join(covering)
+# output:
+# - iats: list (document) of lists (sentences) of booleans (atomic token signatures) representing the whatevers that are themselves tokens
 def build_iats(d, covering):
     iats = []
     for c_s, s in zip(covering, d):
@@ -85,11 +125,26 @@ def build_iats(d, covering):
         iats.append([spn in c_spns for spn in sorted(spns)])
     return iats
 
+# purpose: build all tag layers for a document and collect meta data
+# arguments:
+# - x: tuple of various data, serialized for spark distribution:
+# -- doc: json serialized tokenized document (see build_layers)
+# -- covering: list (see build_layers)
+# -- ltypes: list (see build_layers)
+# -- layers: list (see build_layers)
+# - bc: dict (meta values and function) of variable control utilities for operating process_document as a distributed (map) process
+# prereqs: must be built for spark compatability
+# output: tuple of processed data
+# - d: list document (see build_layers), deserialized from doc
+# - dcon: list (document) of lists (whatevers) of strings (contexts) representing an urolled documents sequence of localities
+# - layers: list (document) of lists (layers) of lists (sentences) of strings (tags) aligned to d
+# - meta: dict (varietal) of collected metadata from the document (see build_document)
 def process_document(x, bc = {}): 
     if not type(bc) == dict: # this allows the function to access broadcast variables through spark
         bc = dict(bc.value)
     doc, covering, ltypes, layers = x
-    # tokenize the document (note: currently the tokenizer is non-serializable, and should be a broadcast variable, too!)
+    # tokenize the document (note: currently the tokenizer is non-serializable, 
+    # which perhaps alternatively could be a broadcast variable?)
 #     d = [self.tokenizer.tokenize(s) for s in doc]
 #     d = [bc['tokenizer'].tokenize(s) for s in doc]
     d = json.loads(doc)
@@ -112,10 +167,17 @@ def process_document(x, bc = {}):
         meta['max_sent'] = 0
     meta['lorder'] = list(ltypes)
     dcon = [[c for c in get_context(i, list(unroll(d)), m = bc['m']) 
-             if (bc['pre_train'] and ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife']))))
-             or not bc['pre_train']] for i, t in enumerate(unroll(d))]
+             if (bc['post_train'] and ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife']))))
+             or not bc['post_train']] for i, t in enumerate(unroll(d))]
     return d, dcon, layers, ltypes, meta
 
+# purpose: count the co-occurrences of whatevers over any target sequence of tags (including whatevers, too) for a document
+# arguments:
+# - x: tuple of various data, serialized for spark distribution (see process_document)
+# - bc: dict (meta values and function) of variable control utilities for operating process_document as a distributed (map) process (see process_document)
+# prereqs: must be built for spark compatability
+# output:
+# - yielded counted co-occurrences between the whatever background distribution, layered over all target tags, and structured as Counter objects for downstream (possibly spark-based) reduce aggregation
 def count(x, bc = {}):
     if not type(bc) == dict: # this allows the function to access broadcast variables through spark
         bc = dict(bc.value)
@@ -126,29 +188,29 @@ def count(x, bc = {}):
     d = json.loads(doc)
     ##
     ltypes, layers = build_layers(d, covering, ltypes, layers)
-    nvs, ess, eds, meta = build_document(d, ltypes, layers)
+    nvs, ess, eds, _ = build_document(d, ltypes, layers) # meta
     if covering:
         its = build_iats(d, covering); bts = build_bots(d, covering); ets = build_eots(d, covering)
         layers = layers + [nvs, its, bts, ets, ess, eds]
         ltypes = ltypes + ['nov', 'iat', 'bot', 'eot', 'eos', 'eod']
-        meta['max_sent'] = max([sum(s) for s in ets])
+        # meta['max_sent'] = max([sum(s) for s in ets])
     else:
         layers = layers + [nvs, ess, eds]
         ltypes = ltypes + ['nov', 'eos', 'eod']
-        meta['max_sent'] = 0
-    meta['lorder'] = list(ltypes)
+        # meta['max_sent'] = 0
+    # meta['lorder'] = list(ltypes)
     ##
     ## replacing: doc_Fs = [self.count(d, old_ife = old_ife)]
     yield from Counter([((t,'form'), c) 
                         for s in [[t_s for ds in d for t_s in ds]] for i, t in enumerate(s)
                         for c in get_context(i,  list(s), m = bc['m']) 
-                        if (bc['pre_train'] and ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife']))))
-                        or not bc['pre_train']]).items()
+                        if (bc['post_train'] and ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife']))))
+                        or not bc['post_train']]).items()
     yield from Counter([((t,'form'), tuple([str(c[1]), c[1], 'attn'])) # c
                         for s in [[t_s for ds in d for t_s in ds]] for i, t in enumerate(s)
                         for c in get_context(i,  list(s), m = bc['m']) 
-                        if (bc['pre_train'] and ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife']))))
-                        or not bc['pre_train']]).items()
+                        if (bc['post_train'] and ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife']))))
+                        or not bc['post_train']]).items()
     ##
     ## replacing: for ltype, layer_Fs in self.count_layers(d, layers = layers, ltypes = ltypes, old_ife = old_ife): doc_Fs.append(layer_Fs)
     for layer, ltype in zip(layers, ltypes):
@@ -157,18 +219,24 @@ def count(x, bc = {}):
                             for s, s_l in [list(zip(*[(t_s, t_l) for ds, ds_l in zip(d, layer) for t_s, t_l in zip(ds, ds_l)]))]
                             for i, (t, l) in enumerate(list(zip(s,s_l)))
                             for c in get_context(i,  list(s), m = bc['m']) 
-                            if (bc['pre_train'] and ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife']))))
-                            or not bc['pre_train']]).items()
+                            if (bc['post_train'] and ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife']))))
+                            or not bc['post_train']]).items()
         ## accrue data for positional distributions
         yield from Counter([((l,ltype), tuple([str(c[1]), c[1], 'attn'])) # c
                             for s, s_l in [list(zip(*[(t_s, t_l) for ds, ds_l in zip(d, layer) for t_s, t_l in zip(ds, ds_l)]))]
                             for i, (t, l) in enumerate(list(zip(s,s_l)))
                             for c in get_context(i,  list(s_l), m = bc['m']) # note s_l, not l!
-                            if (bc['pre_train'] and ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife']))))
-                            or not bc['pre_train']]).items()
+                            if (bc['post_train'] and ((not bc['old_ife']) or (bc['old_ife'] and (t in bc['old_ife'] and c[0] in bc['old_ife']))))
+                            or not bc['post_train']]).items()
         ##
     ##
 
+# purpose: operate spark-based reduce aggregation for pre-processed document meta data
+# arguments:
+# - a: dictionary of varietal metadata (see process_document and build_document)
+# - b: (see a)
+# prereqs: processed metadata from at least two documents
+# output: aggregated dictionary of metadata of same varietal schema as a (and meta, see build_document)
 def aggregate_processed(a, b): # a/b = (Fs, meta)
     alphas = a['alphas']
     for Mt in b['alphas']:
@@ -191,40 +259,30 @@ def aggregate_processed(a, b): # a/b = (Fs, meta)
             'lorder': lorder,
             'f0': a['f0'] + b['f0']})
 
+# purpose: move tensor to gpu (if available)
+# arguments:
+# - x: array of arbitrary dimension
+# prereqs: gpu should be available, otherwise array will be maintained on cpu
+# output: a same-dimension array, ideally on gpu
 def to_gpu(x):
     if torch.cuda.is_available():
         return x.to('cuda')
     return x.to('cpu')
 
+# purpose: make sure tensor is on cpu (detached from any gpu)
+# arguments: 
+# - x: array of arbitrary dimension
+# prereqs: not much (numpy and torch)
+# output: numpy array of arbitrary dimension
 def detach(x):
     if type(x) == torch.Tensor:
         x = x.clone().detach().cpu()
     return np.array(x)
 
+# purpose: flattens a list of lists of things into list of things
+# arguments: 
+# - d: a list of lists of things
+# prereqs: nothing
+# output: a flattened list of things from d
 def unroll(d):
     return [t for s in d for t in s]
-
-class data_streams(torch.utils.data.Dataset):
-    # A PyTorch Dataset wrapper for encoded data streams!
-    # encoded = a dict of lists of integer-encoded layers, m = the context-window size
-    def __init__(self, encoded, m): 
-        self._data = encoded; self._m = m
-        # setting pad to max sequence length
-        # self._pad_length = max([len(stream['cons']) for stream in encoded])
-        # self._data = []; self.load(encoded)
-    def __len__(self):
-        return len(self._data)
-    def __getitem__(self, i):
-        # data are encoded layers, i.e., padded parallel lists of indices
-        return self._data[i] # = {'form': doc_indices, 'tag': tag_indices, ...} 
-    def load(self, encoded):
-        for i, stream in enumerate(encoded):
-            self._data.append(dict(stream))
-            padding = [0] * (self._pad_length - len(stream['cons']))
-            cons_padding = list([0] * (2*self._m + 1)) * (self._pad_length - len(stream['cons']))
-            for ltype in self._data[-1]:
-                # 'cons' and 'amps' layers are 2d for contexts and positional weighting
-                if ltype == 'cons' or ltype == 'amps':
-                    self._data[-1][ltype] += cons_padding
-                else:
-                    self._data[-1][ltype] += padding

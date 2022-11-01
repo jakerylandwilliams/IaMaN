@@ -8,7 +8,7 @@ from functools import reduce, partial
 from collections import Counter, defaultdict
 from .types import Dummy, Whatever, Token, Sentence, Document, Vocab, Cipher
 from ..utils.fnlp import get_context, wave_index, get_wave
-from ..utils.munge import process_document, aggregate_processed, build_eots, count, detach, unroll, data_streams, to_gpu
+from ..utils.munge import process_document, aggregate_processed, build_eots, count, detach, unroll, to_gpu
 from ..utils.stat import agg_vecs, blend_predictions
 from ..utils.hr_bpe.src.bpe import HRBPE
 from ..utils.hr_bpe.src.utils import tokenize, sentokenize
@@ -18,25 +18,59 @@ import pyspark
 conf = pyspark.SparkConf()
 conf.set('spark.local.dir', '/local-data/tmp/')
 
+# purpose: manages and executes all aspects of being of class language model (LM)
+# arguments: see __init__()
+# prereqs: hr_bpe, numpy, torch, pyspark
+# use methods: 
+# - __init__: initialize an LM with user-defined hyperparameters
+# - fit: trains a single-layer LM over a set of documents
+# - post_train: re-trains a single-layer model by refining model.fit() parameters with additional documents
+# - fine_tune: utilizes model.fit() parameters to train a second layer's model on a given set of documents
+# - interpret: utilizes model parameters to predict labels for given documents
+# - generate: utilizes model parameters to iteratively predict the next token
+# - stencil: utilizes model parameters to iteratively attempt to reconstruct the next tokens of documents
+# use attributes:
+# - _documents: list, containing any documents passed through model.interpret() 
 class LM(ABC):
+    # purpose: initialize an LM with user-defined hyperparameters
+    # arguments:
+    # - m: int, no less than 1 for radius of context, building features over +-m tokens
+    # - tokenizer: one of 'hr-bpe' or 'sentokenizer'; other values default to space-wise segmentation
+    # - noise: float, greater than 0 used for sparsity smoothing
+    # - positionally_encode: bool, with True implementing a sinusoidal positional encoding
+    # - seed: initialization seed for model-level randomization
+    # - positional: 'dependent' or 'independent', setting the positional information model
+    # - space: bool, with True allowing space (' ') tokens to operate on their own. False right-justifies text
+    # - attn_type: list, with none, one, or two of the strings 'accumulating' or 'backward' for vector aggregation
+    # - do_ife: bool, with True mapping one-hots dimensions down to frequency-hot vectors
+    # - runners: int, the number of map-reduce runners for data pre-processing
+    # - hrbpe_kwargs: dict, of keyword arguments used to hyperparameterize LM-scoped hr-bpe tokenizers 
+    # - gpu: bool, when True vectors and parameters move from numpy arrays to torch.cuda.current_device() tensors
+    # - bits: int or None, for dimensionality reduction; None defaults to one-hot (standard basis) vectors for the model's vocabulary W. bits cannot be smaller than log2(|W|), which the Cipher defaults to if set too low
+    # output: un-trained model class with user-specified attributes and related helper attributes
     def __init__(self, m = 10, tokenizer = 'hr-bpe', noise = 0.001, positionally_encode = True, seed = None, positional = 'dependent',
                  space = True, attn_type = [False], do_ife = True, runners = 0, hrbpe_kwargs = {}, gpu = False, bits = None): 
-        self._tokenizer_name = str(tokenizer); self._runners = int(runners); self._gpu = bool(gpu)
+        # set basic user-defined parameters for data handling and aggregation
+        self._runners = int(runners); self._gpu = bool(gpu)
+        self._seed = int(seed); self._space = bool(space); self._attn_type = list(attn_type)
+        # set tokenizer-related parameters
+        self._tokenizer_name = str(tokenizer)
         if self._tokenizer_name == 'hr-bpe':
             self._hrbpe_kwargs = {'method': 'char', 'param_method': 'est_theta', 'reg_model': 'mixing', 
                                   'early_stop': True, 'num_batches': 100, 'batch_size': 10_000,
                                   'action_protect': ["\n","[*\(\{\[\)\}\]\.\?\!\,\;][ ]*\w", 
                                                      "\w[ ]*[*\(\{\[\)\}\]\.\?\!\,\;]"],
-                                 } if not hrbpe_kwargs else dict(hrbpe_kwargs)        
-        self._seed = int(seed); self._space = bool(space); self._attn_type = list(attn_type); 
+                                 } if not hrbpe_kwargs else dict(hrbpe_kwargs)
+        # set context and dimensionality reduction parameters
         self._bits = int(bits) if bits is not None else None
-        if do_ife and self._bits is None:
+        if do_ife and self._bits is None: # the user sets integer frequency encipherment
             self._cltype = 'frq'  
-        elif self._bits is not None:
+        elif self._bits is not None: # the user sets bitvector encipherment
             self._cltype = 'bits'
-        else:
+        else: # the user defaults to one-hot encoding
             self._cltype = 'form'
         self._cnull = 0 if ((self._cltype == 'frq') or (self._cltype == 'bits')) else ''
+        # various flags that indicate the current model states and other model parameters 
         self._fine_tuned = False
         self._lorder = list(); self._ltypes = defaultdict(set) 
         if self._seed:
@@ -49,6 +83,7 @@ class LM(ABC):
         self._Tds, self._Tls = defaultdict(Counter), defaultdict(lambda : defaultdict(Counter))
         self._D = defaultdict(set); self._L = defaultdict(lambda : defaultdict(set))
         self._alphas = defaultdict(list); self._total_sentences = 0; self._total_tokens = 0; self._max_sent = 0
+        # containers for processed data, as well as object constructors and object handling methods
         self._documents = []; self._sentences = []; self._tokens = []; self._whatevers = []
         self.array = partial(torch.tensor, dtype = torch.double, device = torch.cuda.current_device()) if self._gpu else np.array
         self.intarray = partial(torch.tensor, dtype = torch.long, device = torch.cuda.current_device()) if self._gpu else np.array
@@ -60,8 +95,15 @@ class LM(ABC):
         self.log10 = torch.log10 if self._gpu else np.log10
         self.stack = torch.stack if self._gpu else np.array
         # self.view = lambda dims, vec: vec.view(*dims) if self._gpu else lambda dims, vec: vec.reshape(*dims)
-
-    # coverings and layers are tokenizations and tag sets
+    # purpose: trains an LM over a set of documents
+    # arguments: 
+    # - docs, a list (corpus) of lists documents of strings (sentences); 
+    # - docs_name, a string name for the data (docs); 
+    # - covering, a list (corpus) of lists (documents) of lists (sentences) of strings (whatevers), the innermost of which concatenate exactly to doc's strings (sentences); 
+    # - all_layers, a dictionary (document-index:multi-tagged-documents) of dictionaries (tag-type:documents) of lists (tag-documents) of lists (tag-sentences) of strings (tags); 
+    # - fine_tune, bool, with True indicating a 2-layer, attention-based model
+    # prereqs: minimally, user provide a set of sentence-tokenized documents and a name for the training corpus
+    # effect: trains a 1- or 2-layer model, powering other class methods (e.g., generate or interpret)
     def fit(self, docs, docs_name, covering = [], all_layers = defaultdict(lambda : defaultdict(list)), 
             fine_tune = False):
         # assure all covering segmentations match their documents
@@ -100,7 +142,7 @@ class LM(ABC):
         else:
             self.tokenizer = Dummy()
             self.tokenizer.tokenize = lambda text: [t for t in re.split('( )', text) if t]
-        # define the tokenizer   
+        # define the fit model's tokenizer method 
         def tokenize(text):
             if self._space:
                 return self.tokenizer.tokenize(text)
@@ -124,13 +166,13 @@ class LM(ABC):
         # attach the tokenizer
         self.tokenize = tokenize
         # tokenize documents and absorb co-occurrences
-        all_data, streams = self.process_documents(docs, all_layers, covering, fine_tune = True) # = fine_tune
+        all_data, streams = self.process_documents(docs, all_layers, covering, fine_tune = fine_tune) 
         # compute the marginals
         print('Computing marginal statistics...')
         self.compute_marginals()
         # build dense models
         print('Building dense output heads...')
-        self.build_dense_output(fine_tune = True) # = fine_tune
+        self.build_dense_output(fine_tune = fine_tune) 
         # build transition matrices for tag decoding
         self.build_trXs(all_data)
         # fine-tune a model for/using attention over predicted contexts
@@ -146,9 +188,20 @@ class LM(ABC):
         return streams
         
     ## now re-structured to train on layers by document
+    # purpose: tokenize documents and absorb co-occurrences
+    # arguments: 
+    # - docs: see .fit;
+    # - all_layers: see .fit
+    # - covering: see .fit 
+    # - update_ife: bool, with True indicating that the model will update its integer frequency encipherment protocol with docs' new data
+    # - update_bow: bool, with True indicating that the model will update its bag of words model for positional encoding, using docs' new data
+    # - fine_tune: see .fit
+    # - post_train: bool, with True indicating that processing is for re-training the base-layer's model over additional documents
+    # prereqs: not to be run by user, operated by system during .fit, .fine_tune, and .post_train methods
+    # output: fully encoded data streams
     def process_documents(self, docs, all_layers = defaultdict(lambda : defaultdict(list)), 
                           covering = [], update_ife = False, update_bow = False, 
-                          fine_tune = False, pre_train = False):
+                          fine_tune = False, post_train = False):
         if (covering and self._tokenizer_name == 'hr-bpe') or (not covering): print('Tokenizing documents...')
         docs = ([json.dumps([self.tokenize(s) for s in doc]) for doc in tqdm(docs)]
                 if (covering and self._tokenizer_name == 'hr-bpe') or (not covering) else [json.dumps(d) for d in covering])
@@ -157,7 +210,7 @@ class LM(ABC):
                             [list(all_layers[d_i].keys()) for d_i in d_is], # ltypes
                             [list(all_layers[d_i].values()) for d_i in d_is])) # layers
         Fs = []; old_ife = Counter(self._ife)
-        bc = {'m': int(self._m), 'old_ife': Counter(self._ife), 'pre_train': pre_train} # 'tokenizer': self.tokenize,
+        bc = {'m': int(self._m), 'old_ife': Counter(self._ife), 'post_train': post_train} # 'tokenizer': self.tokenize,
         if self._runners:
             print('Counting documents and aggregating counts...')
             sc = SparkContext(f"local[{self._runners}]", "IaMaN", self._runners, conf=conf)
@@ -344,15 +397,20 @@ class LM(ABC):
             self._vecsegs[ltype] = (self._vecdim, self._vecdim + len(self._vocs[ltype]))
             self._vecdim += len(self._vocs[ltype])
             self._allvocs += list(self._vocs[ltype])
-        if pre_train:
+        if post_train:
             streams = []
         else:
             print('Encoding data streams for torch processing...')
-            # encoded = self.encode_data(docs, dcons, layers, ltypes)
-            streams = data_streams(self.encode_data(docs, dcons, layers, ltypes), self._m)
+            streams = self.encode_data(docs, dcons, layers, ltypes)
             print(' done.')    
         return all_data, streams
-    
+
+    # purpose: determine encodings and their intensity for a type and context
+    # arguments: 
+    # - t, a tuple of two: (str, str), with the first being the string's type and the second being it's tag-type
+    # - c, a tuple of three: (str, int, str), with the first being the string's type, the second being it's radius (distance) from t, and the third being its tag-type (currently always 'form').
+    # prereqs: not run by user, operated by system during .process_documents and .build_dense_output
+    # output: lists of the encoded types, contexts, and their intensities of interaction
     def encode(self, t, c):
         intensity = 1; ents = [None]
         if self._positionally_encode:
@@ -372,7 +430,12 @@ class LM(ABC):
             if self._cltype == 'bits':
                 ents = [(int(i), 'bits') for i in self._cipher.sparse_encipher(t[0])]
         return ents, encs, intensity
-    
+    # purpose: determine the amplitude of the wavefunction for co-occurrence weighting
+    # arguments:
+    # - c: int (integer frequency) or string (keying an integer frequency) in a bag of whatevers model (._p0)
+    # - dm: int, radius of co-occurrance (distance between c and the other type)
+    # prereqs: not run by user, operated by system during .encode
+    # output: float, intensity of measurement
     def intensity(self, c, dm):
         if type(c) == int:
             theta = c/self._M0
@@ -380,11 +443,19 @@ class LM(ABC):
             theta = self._p0.get(c, 0)
         return (np.cos((2*np.pi*dm*theta) if (c or type(c) == bool) else np.pi) + 1)/2
     
-    ## it looks like context-forms can be masked with ife both here in grokdoc() and count() 
-    ## to control the encoding for the whole system, with exception of generation
+    # purpose: map string-types to integer frequencies as a dimensionality reduction
+    # arguments:
+    # - c, a tuple of three: (str, int, str) (see .encode)
+    # prereqs: not run by user, operated by system during .encode
+    # output: a tuple of three: (str, int, str) (see type c from .encode)
     def if_encode_context(self, c):
         return(tuple([self._ife.get(c[0], 0), c[1], 'frq']))
     
+    # purpose: get a document-length vector of superimposed amplitudes based on its internal bag of whatevers distribution
+    # arguments:
+    # - doc: a list of strings (whatevers) representing an unrolled document
+    # prereqs: not run by user, operated by system during .encode_data
+    # output: a vector of weights for document-level whatever-vector aggregation
     def get_amps(self, doc):
         if False not in self._attn_type:
             wav_idx, wav_f, wav_M, wav_T = wave_index(doc)
@@ -394,20 +465,34 @@ class LM(ABC):
         else:
             return np.ones(len(doc))
         
+    # purpose: encode the corpus for rapid data loading (required for practical use of gpu-based processing)
+    # arguments:
+    # - docs: a list (corpus) of lists (documents) of lists (sentences) of strings (whatevers), the innermost of which are now tokenized sentences 
+    # - dcons: a list (corpus) of lists (documents) of lists (whatevers) of tuples (contexts), the innermost of which are typed positional contexts (see LM.encode, as well as get_context and process_document from src/utils/munge.py)
+    # - layers: list (corpus) of lists (documents) of lists (tag layers) of lists (sentences) of strings (tags)
+    # - ltypes: list (corpus) of lists (documents) of lists (tag types)
+    # prereqs: not run by user, operated by system during .process_documents
+    # output: a list of data streams (see .encode_stream) for each input and output
     def encode_data(self, docs, dcons, layers, ltypes):
         encoded = []
         for doc, dcon, doc_layers, doc_ltypes in zip(docs, dcons, layers, ltypes):
-            encoded.append({'cons': self.encode_stream(dcon, 'cons'),
-                            'amps': self.encode_stream(dcon, 'amps'),
-                            'm0ps': self.encode_stream(dcon, 'm0ps')})
-            encoded[-1]['form'] = self.encode_stream(unroll(doc), 'form')
-            for layer, ltype in zip(doc_layers, doc_ltypes):
-                encoded[-1][ltype] = self.encode_stream(unroll(layer), ltype)
-            encoded[-1]['amp'] = self.double(self.get_amps(unroll(doc)))
-            if self._cltype == 'frq':
-                encoded[-1]['frq'] = self.encode_stream(unroll(doc), 'frq')
+            encoded.append({'cons': self.encode_stream(dcon, 'cons'), # encode the context
+                            'amps': self.encode_stream(dcon, 'amps'), # encode the context's wave amplitude
+                            'm0ps': self.encode_stream(dcon, 'm0ps')}) # encode the context's sign of radius
+            encoded[-1]['form'] = self.encode_stream(unroll(doc), 'form') # encode the whatever types
+            for layer, ltype in zip(doc_layers, doc_ltypes): # iterate through the document's tag layers
+                encoded[-1][ltype] = self.encode_stream(unroll(layer), ltype) # encode the tag layer's types
+            encoded[-1]['amp'] = self.double(self.get_amps(unroll(doc))) # encode document aggregation weights
+            if self._cltype == 'frq': # check if the frequency-context type requires encoding (for ife only)
+                encoded[-1]['frq'] = self.encode_stream(unroll(doc), 'frq') # encode the integer frequency
         return encoded
     
+    # purpose: encode a stream of given layer type (ltype)
+    # arguments:
+    # - stream: a list of ground truth data. numerical types are system controlled, categorical include user-defined tag layers
+    # - ltype: str, uniquely encoding the stream's type of information. currently used ltypes for data streams are: 
+    # prereqs: not run by user, operated by system during .encode_data
+    # output: a system scoped (cpu or gpu) and possibly multidimensional array of encoded stream data
     def encode_stream(self, stream, ltype):
         if ltype == 'cons':
             # return [self.long([self._con_vocs[self._cltype].encode(self.encode(('', 'form'),c)[1]) 
@@ -426,7 +511,14 @@ class LM(ABC):
             return self.long([self._vocs[ltype].encode((self._ife[t[0]], ltype)) for t in stream])
         else:
             return self.long([self._vocs[ltype].encode((t, ltype)) for t in stream])
-        
+    
+    # purpose: manage the encoding of streams of all layer types for a corpus
+    # arguments:
+    # - docs: a corpus of sentence-tokenized documents (see .fit)
+    # - covering: a gold standard tokenization for the corpus (see .fit)
+    # - all_layers: multiple layers of gold standard tags (see .fit)
+    # prereqs: not run by user, operated by system during secondary/predictive (post .fit) exposures to data
+    # output: system scoped (cpu or gpu) and possibly multidimensional arrays of encoded streams of data
     def encode_streams(self, docs, covering = [], all_layers = defaultdict(lambda : defaultdict(list))):
         # tokenize documents
         docs = ([json.dumps([self.tokenize(s) for s in doc]) for doc in docs]
@@ -435,10 +527,10 @@ class LM(ABC):
         all_data = list(zip(docs, [covering[d_i] if covering else [] for d_i in d_is], # docs and covering
                             [list(all_layers[d_i].keys()) for d_i in d_is], # ltypes
                             [list(all_layers[d_i].values()) for d_i in d_is])) # layers
-        bc = {'m': int(self._m), 'old_ife': Counter(self._ife), 'pre_train': False}
+        bc = {'m': int(self._m), 'old_ife': Counter(self._ife), 'post_train': False}
         if self._runners:
             sc = SparkContext(f"local[{self._runners}]", "IaMaN", self._runners, conf=conf)
-#             SparkContext.setSystemProperty('spark.executor.memory', '1g')
+            # SparkContext.setSystemProperty('spark.executor.memory', '1g')
             SparkContext.setSystemProperty('spark.driver.memory', '2g')
             bc = sc.broadcast(bc)
             docs, dcons, layers, ltypes, metas = [], [], [], [], []
@@ -455,9 +547,13 @@ class LM(ABC):
             # collect pre-processed data
             docs, dcons, layers, ltypes, metas = zip(*[process_document([doc, cover, ltypes, layers], bc = bc)
                                                        for d_i, (doc, cover, ltypes, layers) in list(enumerate(all_data))])
-        streams = data_streams(self.encode_data(docs, dcons, layers, ltypes), self._m)
+        streams = self.encode_data(docs, dcons, layers, ltypes)
         return streams, docs
         
+    # purpose: compute marginal co-occurrence statistics used in the analytic noise model
+    # arguments: NA, calculations are based on the existence of cached co-occurrences within self._Fs
+    # prereqs: not run by user, operated by system during process_documents
+    # output: NA, function builds system parameters (statistics) used in balancing noise for sparsity handling
     def compute_marginals(self):
         numcon = len(self._con_vocs[self._cltype])
         self._beta, self._zeta, self._Tn, self._Cn, self._Tvs, self._Cvs = {}, {}, {}, {}, {}, {}
@@ -480,7 +576,11 @@ class LM(ABC):
             if ltype == 'form':
                 self._f = Counter({t[0]: T[t] for t in T if t[1] == 'form'}); self._f[''] = 1
                 self._M = sum(self._f.values())
-            
+                
+    # purpose: wrap the construction of first-order parameter matrices for the system's current store of co-occurrences (in self._Fs)
+    # arguments: fine_tune: bool, see .process_documents, used to restrict the construction of second order parameter matrices
+    # prereqs: not run by user, operated by system during process_documents
+    # output: NA, function builds parameter matrices used in forward prediction of whatevers and tags
     def build_dense_output(self, fine_tune = False):
         for ltype in tqdm(self._Fs):
             ctype = 'attn' if 'attn' in ltype else self._cltype
@@ -508,16 +608,24 @@ class LM(ABC):
                     A[self._vocs[ltype]._type_index[t], self._con_vocs[ctype]._type_index[c]] = self._zeta[ltype][c]*self._Fs[ltype][(t,c)]/cl[c]
                 A[A==0] = self._noise; A /= A.sum(axis = 0); A = np.nan_to_num(-np.log10(A))
                 self._As[ltype] = self.array(A); del(A)
-        
-    def pre_train(self, ptdocs, update_ife = False, update_bow = False, fine_tune = False):
+                
+    # purpose: re-trains a previously-trained single-layer model by refining model.fit() parameters with additional documents
+    # arguments: 
+    # - ptdocs: a list (corpus) of lists (documents) of lists (sentences). (see .fit for further details)
+    # - update_ife: bool, with True indicating that the updated model's integer frequency encipherment should be updated. (only has affect when ife is used)
+    # - update_bow: bool, with True indicating that the updated model's bag of whatevers positional encoding model should be updated (only has affect when positional encoding is used)
+    # - fine_tune: bool, with True indicating that sparse poritions of the 2-layer, attention-based model should be updated as well, i.e., which means that the .fine_tune method will likely be used afterwards to re-train the second order model away from ptdocs and towards a small target set.
+    # prereqs: requires a previously-trained model to exist and be updated. intended for use in densification of first order models, and thus refined second order models. for low-footprint models, use should train an initial model using .fit on the target (gold standard) training set. following this, .post_train should be used to densify the statistics of the target inputs and outputs using external data  (ptdocs).
+    # output: a re-trained model, potentially in need of being .fine_tune()'ed on target data.
+    def post_train(self, ptdocs, update_ife = False, update_bow = False, fine_tune = False):
         if ptdocs:
             ptdocs = [["".join(s) for s in d] for d in ptdocs]
-            print("Processing pre-training documents...")
-            ptdata, ptstreams = self.process_documents(ptdocs, update_ife = update_ife, update_bow = update_bow, pre_train = True)
+            print("Processing post-training documents...")
+            ptdata, ptstreams = self.process_documents(ptdocs, update_ife = update_ife, update_bow = update_bow, post_train = True)
             print("Re-computing marginal statistics...")
             self.compute_marginals()
             print("Re-building dense output heads...")
-            self.build_dense_output(fine_tune = True) ############ fine_tune = fine_tune
+            self.build_dense_output(fine_tune = fine_tune)
             # report model statistics
             print('Done.')
             print('Model params, types, encoding size, contexts, vec dim, max sent, and % capacity used:', 
@@ -525,6 +633,10 @@ class LM(ABC):
                   len(self._con_vocs[self._cltype]), self._vecdim, self._max_sent,
                   round(100*len(self._Fs[self._cltype])/(len(self._con_vocs[self._cltype])*len(self._ltypes['form'])), 3))
 
+    # purpose: builds transition matrices for token-level viterbi decoding of tags
+    # arguments: all_data: list (corpus) of lists (documents) of lists (layers) of lists (sentences) of strings (whatevers or tags)
+    # prereqs: not a user-run function, requires a processed (including tokenized) corpus of data
+    # output: parameter matrix attributes are stored within the object for later use in decoding within the .interpret method
     def build_trXs(self, all_data): # viterbi decoding will work best with token-level transitions
         print("Counting for transition matrices...")
         self._trFs = defaultdict(Counter)
@@ -534,7 +646,7 @@ class LM(ABC):
                 self._trFs[ltype] += Counter(list(zip(lstream[1:], lstream[:-1])))
             d, _, layers, ltypes, _ = process_document((doc, cover, ltypes, layers), bc = {'m': int(self._m), 
                                                                                            'old_ife': Counter(self._ife), 
-                                                                                           'pre_train': False})
+                                                                                           'post_train': False})
             for ltype, layer in zip(ltypes, layers):
                 if ltype not in ['nov', 'iat', 'bot', 'eot', 'eos', 'eod']: continue
                 lstream = [''] + [lt for ls in layer for lt in ls]
@@ -562,25 +674,56 @@ class LM(ABC):
                     self._trXs[ltype][zees,j] = (1 - bet)/Cn
                     self._trXs[ltype][nonz,j] *= bet
                 self._trXs[ltype][:,j] /= self._trXs[ltype][:,j].sum()
-    
+
+    # purpose: abstracts inner products, in-line with the used computational framework
+    # arguments: 
+    # - x: array (left) in inner product
+    # - y: array (right) in inner product
+    # prereqs: an initialized model class
+    # output: a tensor of type (on gpu or cpu) given by the computational framework
     def dot(self, x, y):
         return x.matmul(y) if self._gpu else x.dot(y)
-    
+
+    # purpose: abstracts array re-shaping, in-line with the used computational framework
+    # arguments: 
+    # - dims: tuple of ints, indicating the target dimensionality (shape), with -1 leaving the size of any dimension free
+    # - vec: array to be re-shaped, must have the same product dimension as the target 
+    # prereqs: an initialized model class
+    # output: an array of target (dims) dimension
     def view(self, dims, vec):
         return vec.view(*dims) if self._gpu else vec.reshape(*dims)
-    
+
+    # purpose: abstracts outer products, in-line with the used computational framework
+    # arguments:
+    # - x: array (left) of one dimension in outer product
+    # - y: array (right) of one dimension in outer product
+    # prereqs: an initialized model class
+    # output: a two-dimensional array of outer dimension
     def outer(self, x, y):
         if self._gpu:
             return x.view(-1,1) * y
         else:
             return np.outer(x,y)
-        
+    
+    # purpose: abstracts finding an array's min value, in-line with the used computational framework
+    # arguments: 
+    # - x: array (left) of arbitrary dimension
+    # - axis: int, defining the axis of minimization
+    # prereqs: an initialized model class
+    # output: the scalar minimizer of the input array      
     def min(self, x, axis = 1):
         if self._gpu:
             return torch.min(x, axis = axis).values
         else:
             return np.min(x, axis = axis)
-    
+
+    # purpose: make a first order prediction from the given contexts and their amplitudes for the given layer (tag) types
+    # arguments: 
+    # - amps: array (contexts) of floats (amplitudes) 
+    # - cons: array (contexts) of ints (types)
+    # - ltypes: list of strings (tag types) for which to make predictions
+    # prereqs: a trained first-order model (also used in second-order models), obtained after running .fit
+    # output: a concatenation of prediction vectors in the order of layers specified by ltypes
     def P1(self, amps, cons, ltypes):
         Ps = []; Csum = (self._Cvs[self._cltype][cons]*amps).sum()
         for ltype in ltypes:
@@ -589,6 +732,16 @@ class LM(ABC):
             Ps[-1] = 10**-(Ps[-1] - Ps[-1].min()); Ps[-1] /= Ps[-1].sum()
         return self.cat(Ps)
 
+    # purpose: manage the computation of first order predictions (a representation) for a stream of data
+    # arguments: 
+    # - stream: a possibly multidimensional array of encoded stream data (see output from: .encode_stream)
+    # - predict_contexts: bool, if True predicts vectors of context encoding, otherwise predicts according to ltypes
+    # - forward: bool, if True decodes vectors in sequential (left to right) directional (LM'ing) order
+    # - ltypes: list (layers) of strings (layer-types) to be decoded within the representation vectors
+    # - to_cpu: bool, with True indicating that vectors in the stream should be detached from the gpu (if one's being used)
+    # - previous_vecs: list of 1-d arrays being passed through from a previous sequential decoding step (only needed if forward == True)
+    # prereqs: a model trained using .fit
+    # output: a list of prediction vectors for the stream of data
     def R1(self, stream, predict_contexts = False, forward = True, 
            ltypes = [], to_cpu = True, previous_vecs = []):
         vecs = [] + previous_vecs
@@ -615,7 +768,15 @@ class LM(ABC):
             if to_cpu:
                 vecs[-1] = detach(vecs[-1])
         return vecs
-        
+
+    # purpose: utilizes model.fit() parameters to train a second layer's model on a given set of documents
+    # arguments: 
+    # - docs: a list (corpus) of lists (documents) lists (sentences) (see .fit)
+    # - covering: see .fit
+    # - all_layers: see .fit
+    # - streams: a list (corpus) of possibly multidimensional arrays of encoded streams of data (see output from: .encode_stream). note: if data streams are provided, they will be utilized (avoiding pre-processing) instead of the docs.
+    # prereqs: a trained single-layer model, responsible for producing an initial representation over the data
+    # output: learned attributes, principally including a second layer of matrix parameters encoding the response to attended features
     def fine_tune(self, docs, covering = [], all_layers = defaultdict(lambda : defaultdict(list)), streams = []):
         if not streams:
             streams, _ = self.encode_streams(docs, covering = covering, all_layers = all_layers)
@@ -640,7 +801,14 @@ class LM(ABC):
             self._Ls[ltype] /= self._Ls[ltype].sum(axis=1)[:,None]
             self._Ls[ltype] = self.array(np.nan_to_num(-np.log10(detach(self._Ls[ltype]))))
         self._fine_tuned = True
-        
+
+    # purpose: manage the computation of second order predictions from a list of first order predictions
+    # arguments: 
+    # - cvecs: list of arrays (context) being attended with each other for an underlying data stream
+    # - previous_avecs: list of arrays (prediction vectors) directionally produced (left to right) from cvecs
+    # - forward: bool, controling directionality of featurization->prediction (see .R1)
+    # prereqs: a trained second-order model, leant from using the class' .fine_tune method
+    # output: a list of arrays blending the predictions from .R1 via a user-defined attention model
     def attend(self, cvecs, previous_avecs = [], forward = True):
         avecs = [] + previous_avecs
         for wi in range(len(avecs), len(cvecs)):
@@ -672,7 +840,15 @@ class LM(ABC):
                 avec = self.view((2*self._m + 1,len(self._vocs[self._cltype])), dcv).sum(axis = 0)
             avecs.append(avec/avec.sum())
         return avecs
-    
+
+    # purpose: superimpose a second order context vector from a list of vectors and the original data stream
+    # arguments: 
+    # - amps: an array of floats (amplitudes) 
+    # - cons: an array of ints (context types)
+    # - avecs: an array of first-order prediction vectors (output from .R1)
+    # - wi: int, the position within the list of vectors (and original data stream) around which the context is centered
+    # prereqs: not user-driven, see .fine_tune for implicit use
+    # output: an array of comtext-dimensionality
     def dense_context(self, amps, cons, avecs, wi): 
         dcv = self.array(np.zeros(len(self._con_vocs[self._cltype])))
         window = self.long(range(max([wi-self._m, 0]),min([wi+self._m+1, len(avecs)])))
@@ -696,6 +872,16 @@ class LM(ABC):
             dcv[cons] = amps
         return dcv
 
+    # purpose: produce second-order prediction for a stream of data at a point (wi)
+    # arguments: 
+    # - amps: an array of floats (amplitudes)
+    # - cons: an array of ints (context indices)
+    # - avecs: an array of first-order prediction vectors (output from .R1)
+    # - wi: int, the index-location within the stream for which the prediction is being made
+    # - ltypes: list (layers) of strings (layer types) indicating which layers for which to provide a second order prediction
+    # - dense_predict: bool, if True indicates that the model will flippantly use a second-order context on a first-order model's parameters (experimental).
+    # prereqs: not user driven (see .R2), requires a trained second-order model using .fit(..., fine_tune = True)
+    # output: a prediction vectors for those layer types indicated in ltypes
     def P2(self, amps, cons, avecs, wi, ltypes, dense_predict):
         dcv = self.dense_context(amps, cons, avecs, wi)
         Ps = []; Csum = self.dot(dcv, self._Cvs[self._cltype])
@@ -709,7 +895,11 @@ class LM(ABC):
             # note the next step applies the 'residual' connection from self.P1)
             Ps[-1] = Ps[-1] + self.P1(amps, cons, [ltype]); Ps[-1] /= Ps[-1].sum() 
         return self.cat(Ps)
-    
+
+    # purpose: manage the computation of second order predictions (a representation) for a stream of data
+    # arguments: 
+    # prereqs: 
+    # output:     
     def R2(self, stream, predict_contexts = False, forward = True, ltypes = [], to_cpu = True, 
            previous_vecs = [], previous_avecs = [], previous_cvecs = [], dense_predict = True):
         vecs = [] + previous_vecs; cvecs = [] + previous_cvecs; avecs = [] + previous_avecs
@@ -740,7 +930,25 @@ class LM(ABC):
             if to_cpu: 
                 vecs[-1] = detach(vecs[-1])
         return vecs, avecs, cvecs
-    
+
+    # purpose: establish a rapport with whatever (and whatever they construct), i.e., absorb predictions about whatever and record implications
+    # arguments: 
+    # - wi: int, representing the character-position of whatever within its pre-tokenized superstring
+    # - w: str, representing the fundamental type of whatever 
+    # - eot: bool, with True representing whatever's status as the end of a token
+    # - eos: bool, with True representing whatever's status as the end of a sentence
+    # - eod: bool, with True representing whatever's status as the end of a document
+    # - nov: bool, with True representing whatever's status as a type not before seen in its document
+    # - atn: float, constructed as the superposition of wave amplitudes from document whatevers and their siusoidal bag (BOW) model
+    # - vec: array, constructed via prediction(s) based on sliding-window contexts of either first or second order and learnt model parameters
+    # - seed: int, randomizing sampling conducted by the function for absorption of predicted semantics
+    # - all_vecs: list of arrays, representing all vectors having been constructed for the overall data stream, used in aggregation
+    # - all_atns: list of floats, representing all aggregations weights used for aggregation within the data stream
+    # - all_nrms: list of norms positively-derived from weights, and also used in aggregations within the data stream
+    # - all_ixs: list of character indices for all whatevers within the data stream
+    # - tags: dict of typed tags to be applied to this whatever
+    # prereqs: not a user-driven function, numerous arguments are provided for application to the system's internal document model in situ of prediction
+    # output: NA, .grok only absorbs information (and takes actions, where appropriate) given the provided predictions and situational context
     def grok(self, wi, w, eot, eos, eod, nov, atn, vec, seed, 
              all_vecs, all_atns, all_nrms, all_ixs, tags = {}):
         self._whatevers.append(Whatever(w, ix = self._ix, sep = eot, nov = nov, 
@@ -778,7 +986,13 @@ class LM(ABC):
                                                                                  for w in t._whatevers])),
                                                     **kwargs)); 
                     self._w_set = set(); self._ix = 0; self._sentences = []
-    
+
+    # purpose: perform a viterbi-algorithm decoding of the given set of probabilistic vectors
+    # arguments: 
+    # - vecs: a list of arrays (probability distributions)
+    # - ltype: str, indicating the layer-type (including tags) for predictions to be decoded
+    # prereqs: a sequence of prediction arrays with sections tagged for the different types (tags) of predictions to be made
+    # output: a list of decoded tags (strings)
     def viterbi(self, vecs, ltype):
         # start off the chain of probabilities 
         V = [{}]; segsum = sum(vecs[0][self._vecsegs[ltype][0]:self._vecsegs[ltype][1]])
@@ -808,19 +1022,36 @@ class LM(ABC):
             tags.insert(0, V[i + 1][pt]["pt"])
             pt = V[i + 1][pt]["pt"]
         return [t[0] for t in tags]
-    
+
+    # purpose: provide both the most-likely prediction (arg-max) and prediction Counter for a given point
+    # arguments: 
+    # - vec: an array, representing the probabilistic vector over which the prediction is sampled
+    # - ltype: str, representing the type of tag to be sampled (pointing to its vocabulary)
+    # prereqs: not user driven, implicitly operated by one of .generate, .interpret, or .stencit, and requiring a trained model and prediction vector
+    # output:  a tuple, consiting of a string (the predicted type) and its prediction Counter
     def output(self, vec, ltype):
         segsum = sum(vec[self._vecsegs[ltype][0]:self._vecsegs[ltype][1]])
         layer_Ps = Counter({t: vec[self._vecsegs[ltype][0]:self._vecsegs[ltype][1]][self._vocs[ltype]._type_index[t]]/segsum
                             for ix, t in enumerate(self._vocs[ltype])})
         layer_that = list(layer_Ps.most_common(1))[0][0]
         return(layer_that, layer_Ps)
-    
+
+    # purpose: require a token within a sentence to relent an iterator containing its dependencies
+    # arguments: 
+    # - sentence: a list of Token objects
+    # - t_i: a int representing the position within the sentence whose Token is being traversed
+    # prereqs: a constructed docuemtn object, consisting of a list of sentences
+    # output: an iterator of indices for other Tokens within the sentence that are linguistically dependent (up to tags) on t_i'th token
     def yield_branch(self, sentence, t_i):
         yield t_i
         for i_t_i in sentence[t_i]._infs:
             yield from self.yield_branch(sentence, i_t_i)
-    
+
+    # purpose: tag a sentence of tokens with dependency tags, using an ad hoc likelihood ascention process
+    # arguments: 
+    # - tvecs: a list (sentence) of dependency-predicting arrays to be sampled for tags
+    # prereqs: a list of token-aggregated probabilistic vectors
+    # output: a tuple of sups, deps, infs containing a lists of ints, strs, and lists of ints, encoding suprema, dependence-types, and subesquent dependences
     def tag_tree(self, tvecs):
         # dep/sup/infs prediction only engages upon sentence completion
         tags = []; sups = ['']*len(tvecs); deps = ['']*len(tvecs); infss = [[] for _ in range(len(tvecs))]
@@ -886,7 +1117,13 @@ class LM(ABC):
                         new_tag_max_vals.append((max_p, max_vals))
             # its += 1
         return sups, deps, infss
-    
+
+    # purpose: decode a sequence of probabilistic vectors for their representation of end-of-token status
+    # arguments: 
+    # - vecs: a list of probabilistic arrays of floats (for whatevers)
+    # - decode_method: either 'viterbi' or other, defaulting the arg-max prediction
+    # prereqs: not user-driven, operated by .interpret over a stream of prediction vectors (vecs) and an intended decode method
+    # output: a list of boolean values indicating the True/False sampling of the prediction
     def decode_eots(self, vecs, decode_method = 'viterbi'):
         # viterbi decode is_token status for whatevers
         if decode_method == 'viterbi':
@@ -937,7 +1174,13 @@ class LM(ABC):
                     eots[wii-1] = bot
                 bot_i += 1
         return eots
-    
+
+    # purpose: decode a sequence of probabilistic vectors for their representation of end-of-sentence status
+    # arguments: 
+    # - tvecs: a list of probabilistic array of floats (for tokens)
+    # - twis: a list (for each token) of character indices of subsumed whatevers
+    # prereqs: not user-driven, operated by .interpret over a stream of prediction vectors (vecs) and an intended decode method
+    # output: a list of boolean values indicating the sampling of the prediction   
     def decode_eoss(self, tvecs, twis):
         # decoding the sentence segmentation
         tokens = []; teoss = []
@@ -952,18 +1195,32 @@ class LM(ABC):
         if not eoss[-1]: eoss[-1] = True
         return eoss
     
-    def decode_poss(self, tvecs, twis, decode_method = 'viterbi'):
+    # purpose: decode a sequence of probabilistic vectors for their representations by unbound token tags
+    # arguments: 
+    # - tvecs: a list of probabilistic array of floats (for tokens)
+    # - twis: a list (for each token) of character indices of subsumed whatevers
+    # - decode_method: either 'viterbi' or other, defaulting the arg-max prediction
+    # prereqs: not user-driven, operated by .interpret over a stream of prediction vectors (vecs) and an intended decode method
+    # output: a list of boolean values indicating the sampling of the prediction      
+    def decode_tags(self, tvecs, twis, ltype, decode_method = 'viterbi'):
         # viterbi decode pos tags
         if decode_method == 'viterbi':
-            tposs = self.viterbi(tvecs, 'pos')
+            ttags = self.viterbi(tvecs, ltype)
         # argmax decode pos tags
         if decode_method == 'argmax':
-            tposs = [list(self.output(vec, 'pos')[1].most_common(1))[0][0][0] for vec in tvecs]
-        poss = []
-        for ti in range(len(tposs)):
-            poss.extend([tposs[ti]]*len(twis[ti]))
-        return poss
-    
+            ttags = [list(self.output(vec, ltype)[1].most_common(1))[0][0][0] for vec in tvecs]
+        tags = []
+        for ti in range(len(ttags)):
+            tags.extend([ttags[ti]]*len(twis[ti]))
+        return tags
+
+    # purpose: decode a sequence of probabilistic vectors for their representation of parse-tagging information
+    # arguments: 
+    # - tvecs: a list of probabilistic array of floats (for tokens)
+    # - twis: a list (for each token) of character indices of subsumed whatevers
+    # - eoss: a list of boolean values indicating whether the position marks the end of a sentence
+    # prereqs: not user-driven, operated by .interpret over a stream of prediction vectors (vecs) and an intended decode method
+    # output: a list of boolean values indicating the sampling of the prediction      
     def decode_parse(self, tvecs, twis, eoss):
         ssts = [0]; seds = []
         tsups, tdeps, tinfss = [], [], []; sups, deps, infss = [], [], []
@@ -980,7 +1237,14 @@ class LM(ABC):
             deps.extend([tdeps[ti]]*len(twis[ti]))
             infss.extend([tinfss[ti]]*len(twis[ti]))
         return sups, deps, infss
-    
+
+    # purpose: decode a sequence of probabilistic vectors for their representation of sentence type information
+    # arguments: 
+    # - svecs: a list of probabilistic array of floats (for sentences)
+    # - stis: a list (for each sentences) of character indices of subsumed tokens
+    # - twis: a list (for each token) of character indices of subsumed whatevers
+    # prereqs: not user-driven, operated by .interpret over a stream of prediction vectors (vecs) and an intended decode method
+    # output: a list of boolean values indicating the sampling of the prediction      
     def decode_stys(self, svecs, stis, twis):
         sstys = []; stys = []
         for svec in svecs:
@@ -988,7 +1252,18 @@ class LM(ABC):
         for si in range(len(svecs)):
             stys.extend([sstys[si]]*sum([len(twis[ti]) for ti in stis[si]]))
         return stys
-    
+
+    # purpose: determine predictions for user-specified layers over a corpus of documents
+    # arguments: 
+    # - docs: see .fit
+    # - covering: see .fit, enoforces token-level predictions over a gold covering
+    # - all_layers: see .fit
+    # - seed: controls randomization for all numpy processes
+    # - predict_tags: bool, if False system will not sample tags from prediction vectors
+    # - predict_contexts: bool, if True system will predict context vectors, instead of LM's (vocabulary-prediction vectors)
+    # - dense_predict: bool, if True system will use dense contexts (integrating first-order predictions) for prediction of all tags (experimental)
+    # prereqs: a trained model, provided by the .fit method
+    # output: NA, system will store tags and other predictables within the ._documents object as per the .grok method
     def interpret(self, docs, covering = [], all_layers = defaultdict(lambda : defaultdict(list)),
                   seed = None, predict_tags = True, predict_contexts = False, dense_predict = False):
         streams, docs = self.encode_streams(docs, covering = covering, all_layers = all_layers)
@@ -1025,7 +1300,11 @@ class LM(ABC):
             # determine the part of speech tags, if necessary
             poss = [None for _ in range(len(vecs))]
             if ('pos' in self._lorder) and ('pos' not in all_layers) and predict_tags:
-                poss = self.decode_poss(tvecs, twis)
+                poss = self.decode_tags(tvecs, twis, 'pos')
+            # determine the lemma tags, if necessary
+            lems = [None for _ in range(len(vecs))]
+            if ('lem' in self._lorder) and ('lem' not in all_layers) and predict_tags:
+                lems = self.decode_tags(tvecs, twis, 'lem')
             # determine the parse tags, if necessary
             sups, deps, infss = [None for _ in range(len(vecs))], [None for _ in range(len(vecs))], [[] for _ in range(len(vecs))]
             if ('sup' in self._lorder) and ('sup' not in all_layers[d_i]) and predict_tags:
@@ -1042,12 +1321,21 @@ class LM(ABC):
                        [di for di, sis in enumerate(dsis) for si in sis for ti in stis[si] for _ in twis[ti]]]
             all_vecs = (vecs, tvecs, svecs, dvecs); all_atns = (atns, tatns, satns, datns)
             all_nrms = ([1 for _ in range(len(vecs))], tnrms, snrms, dnrms)
-            for w, eot, eos, eod, pos, sup, dep, infs, sty in zip(docstream, eots, eoss, eods, poss, sups, deps, infss, stys):
-                tags = {'pos': pos, 'sup': sup, 'dep': dep, 'infs': infs, 'sty': sty}
+            for w, eot, eos, eod, pos, lem, sup, dep, infs, sty in zip(docstream, eots, eoss, eods, poss, lems, sups, deps, infss, stys):
+                tags = {'pos': pos, 'lem': lem, 'sup': sup, 'dep': dep, 'infs': infs, 'sty': sty}
                 self.grok(wi, w, eot, eos, eod, w in self._w_set, atns[wi], vecs[wi], seed, 
                           all_vecs, all_atns, all_nrms, all_ixs, tags = tags)
                 wi += 1
-    
+
+    # purpose: determine predictions for the forms of a corpus of documents
+    # arguments: 
+    # - docs: see .fit
+    # - covering: see .fit, enoforces token-level predictions over a gold covering
+    # - verbose: bool, with True indicating that information about the predictions will be printed to STDOUT
+    # - return_output: bool, whereupon the function will return a list (corpus) of lists (documents) of prediction probabilities for the corpus's target whatevers
+    # - dense_predict: bool, whereupon the function with utilize dense context vectors on the first-order model's parameters for prediction (experimental)
+    # prereqs: a model trained by .fit
+    # output: if return_output == True: then a list of predictions of prediction is returned, otherwise NA
     def stencil(self, docs, covering = [], verbose = True, return_output = False, dense_predict = False):
         streams, docs = self.encode_streams(docs, covering = covering); ps = []
         for d_i in tqdm(range(len(streams))):
@@ -1066,7 +1354,22 @@ class LM(ABC):
                   round(1/(10**(np.log10([p[1] for p in ps[-1] if p[1] is not None]).mean())), 2),
                   len(ps[-1]), len([p[1] for p in ps[-1] if p[1] is not None]))
         if return_output: return ps
-    
+
+    # purpose: determine predictions for the forms of a system-derived corpus to-be-determined
+    # arguments: 
+    # - m: int, at least one equal to the number of whatevers to generate
+    # - prompt: str, to be tokenized indicating the context horizion from whose contexts generation is based
+    # - docs: see .fit
+    # - Td: Counter, of document's by-whatever integer frequenices
+    # - revise: list of character indices, representing a span of intersecting whatevers to re-predict (experimental)
+    # - top: float, or int, determining sampling method for generation. if int, sample selects from the integer list up to that point, and if float, samples up to that (number's) cumulative probability
+    # - covering: see .fit
+    # - seed: int, see stencil
+    # - verbose: bool, see stencil
+    # - return_output: bool, see .stencil
+    # - dense_predict: bool, see .interpret
+    # prereqs: a trained model (see .fit)
+    # output: if return_output == True: then a list of predictions of prediction probabilities is returned, otherwise NA
     def generate(self, m = 1, prompt = "", docs = [], Td = Counter(), revise = [], top = 1., covering = [], 
                  seed = None, verbose = True, return_output = False, dense_predict = False):
         test_ps = [[]]; d_i, w_i = 0, 0
