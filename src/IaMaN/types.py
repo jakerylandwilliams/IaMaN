@@ -1,4 +1,6 @@
 import numpy as np
+from collections import Counter
+from ..utils.stat import noise
 
 # purpose: for when you can really just go for an object, even if you don't know why
 # arguments: none
@@ -298,3 +300,80 @@ class Cipher:
     # output: array of indices that indices representing active bits in a 1-normed bit vector
     def sparse_encipher(self, w):
         return np.array(self._sparse_index[w]) if w in self._type_index else np.array([])
+    # determines if whatever has a representation in the cipher
+    def __contains__(self, whatever):
+        return whatever in self._type_index
+    
+class Edgevec:
+    def __init__(self, representation = lambda x: np.array([{'': 0.}.get(x, 1.)])):
+        self.rep = representation
+        self._bits = 1 if self.rep is None else (1 + self.rep._bits if hasattr(self.rep, '_bits') else 2)
+    def __call__(self, x):
+        return (np.array([{'': 1}.get(x, 0)]) if self.rep is None else 
+                np.concatenate([np.array([{'': 1}.get(x, 0)]), self.rep(x)]))
+    
+class Basis:
+    def __init__(self, vocabulary):
+        self._bits = len(vocabulary)
+        self.voc = vocabulary
+    def __call__(self, x):
+        vec = np.zeros(self._bits); vec[self.voc.encode(x)] = 1
+        return vec
+    
+class Numvec:
+    def __init__(self, max = 1, representation = None):
+        self.rep = representation; self._max = max
+        self._bits = 1 if self.rep is None else (1 + self.rep._bits if hasattr(self.rep, '_bits') else 2)
+    def __call__(self, x):
+        return (np.array([1/self._max if x == '' else x/self._max]) if self.rep is None else 
+                np.concatenate([np.array([1/self._max if x == '' else x/self._max]), self.rep(x)]))
+    
+class Represent:
+    def __init__(self, data = None, bits = 0, numerical = 0, noisy = True, btype = 'nf'):
+        self._bits_set = int(bits); self._numerical = numerical; self._noisy = noisy # ; self._btype = btype
+        if data is None:
+            self._bits = 2 # + (1 if numerical else 0)
+            self.rep = None if numerical else lambda x: np.array([{'': 0.}.get(x, 1.)])
+            self.rep = Edgevec(Numvec(numerical, self.rep)) if numerical else Edgevec(self.rep)
+        else:
+            self._f =  Counter([t for d in data for t in d]); self._M = sum(self._f.values()); self._k = len(data)
+            self._df = Counter([ti[0] for ti in Counter([(t,i) for i, d in enumerate(data) for t in d])])
+            self._n = Counter([self._f[t] for t in self._f])
+            self.build_cipher(self._bits_set, btype)
+            
+    def set_btype(self, btype):
+        self._btype = btype
+        if self._btype == 'df':
+            self._beta = Counter({t: self._df[t]/(self._k + 1) for t in self._df})
+        elif self._btype == 'nf':
+            self._beta = Counter({t: 1/self._n[self._f[t]] for t in self._f})
+        elif self._btype == 'f':
+            self._beta = Counter({t: self._f[t]*self._n[self._f[t]]/(self._f[t]*self._n[self._f[t]] + 1) for t in self._f})
+        else:
+            self._beta = Counter()
+        
+    def update_cipher(self, data, btype = ''):
+        self._f += Counter([t for d in data for t in d]); self._M = sum(self._f.values()); self._k += len(data)
+        self._df += Counter([ti[0] for ti in Counter([(t,i) for i, d in enumerate(data) for t in d])])
+        self._n = Counter([self._f[t] for t in self._f])
+        self.set_btype(btype if btype else self._btype)
+        self.build_cipher(self._bits_set, btype if btype else self._btype)
+        
+    def build_cipher(self, bits, btype):
+        if bits > 0:
+            self._bits = bits + 1 + (1 if self._numerical else 0)
+            self.cipher = Cipher([t for t, _ in self._f.most_common()], bits = bits)
+            self.vec = self.cipher.encipher
+        else:
+            self.vec = Basis(Vocab([t for t in set(self._f.values() if bits < 0 else self._f.keys())]))
+            self._bits = self.vec._bits + 1 + (1 if self._numerical else 0)
+        self._frep = sum([self.vec(self._f[t] if bits < 0 else t)*self._f[t] for t in self._f])
+        self.set_btype(btype)
+        if self._noisy:
+            self.rep = lambda t: noise(self.vec(self._f[t] if bits < 0 else t), self._beta.get(t, 1), self._frep)
+        else:
+            self.rep = lambda t: self.vec(self._f[t] if bits < 0 else t)
+        self.rep = Edgevec(Numvec(self._numerical, self.rep)) if self._numerical else Edgevec(self.rep)
+        
+    def __call__(self, t):
+        return self.rep(t)

@@ -14,7 +14,7 @@ from collections import defaultdict
 # - space: bool, with True indicating that the space characters will pad tokens to their right (right justified tokens)
 # prereqs: previously-accessed ud-data stored in load_dir, accessed from: https://www.salesforce.com/products/einstein/ai-research/the-wikitext-dependency-language-modeling-dataset/
 # output: deserialized wikitext files
-def load_wikitext(v = "2", split = "train", num_articles = 10, load_dir = '/local-data/',
+def load_wikitext(v = "2", split = "train", num_articles = 10, load_dir = '/data/', # '/local-data/'
                   seed = 691, all_articles = None, rebuild = False, space = True):
     if all_articles is not None:
         articles = np.array(all_articles)
@@ -72,7 +72,7 @@ def load_wikitext(v = "2", split = "train", num_articles = 10, load_dir = '/loca
 # - space: bool, with True indicating that the space character will be included in-stream alongside tokens, and otherwise ignored
 # prereqs: previously-accessed ud-data stored in load_dir, accessed from: https://lindat.mff.cuni.cz/repository/xmlui/handle/11234/1-4758
 # output: deserialized universal dependencies files
-def load_ud(language, num_articles = 10, seed = 691, load_dir = "/local-data/UD/",
+def load_ud(language, num_articles = 10, seed = 691, load_dir = "/data/UD/", # "/local-data/UD/"
             all_articles = None, rebuild = False, load_set = 'all', space = True):
     available_languages = defaultdict(list)
     for ud_dir in os.listdir(load_dir+'ud-treebanks-v2.9/'):

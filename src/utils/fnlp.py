@@ -11,15 +11,27 @@ from collections import Counter, defaultdict
 # - m: int, greater than 1 indicating the radius of context to draw 
 # prereqs: a list of strings (sentence) over which to draw a context for a given point (i)
 # output: a list (contexts) of tuples (str, int, str), indicating the string value of the context, its radius from the center (i), and its layer type, respectively
+# def get_context(i, sentence, m = 20):
+#     radii = range(-m,m+1); locs = range(i-m,i+m+1)
+#     components = [(ra, lo) for ra, lo in zip(radii, locs) 
+#                   if lo >= 0 and lo < len(sentence)] # and sentence[lo]
+#     if components:
+#         radii, locs = zip(*components)
+#         components = [np.concatenate([[sentence[lo] for lo in locs]])]
+#         weights = np.array(list(radii))
+#         components.append(weights)
+#         components.append(['form']*len(locs))
+#     return(list(zip(*components)))
+
 def get_context(i, sentence, m = 20):
     radii = range(-m,m+1); locs = range(i-m,i+m+1)
-    components = [(ra, lo) for ra, lo in zip(radii, locs) 
-                  if lo >= 0 and lo < len(sentence)] # and sentence[lo]
+    components = [(ra, lo) if (lo >= 0 and lo < len(sentence)) else (ra, -1)
+                  for ra, lo in zip(radii, locs)] # and sentence[lo]
     if components:
         radii, locs = zip(*components)
-        components = [np.concatenate([[sentence[lo] for lo in locs]])]
-        weights = np.array(list(radii))
-        components.append(weights)
+        components = [np.concatenate([[sentence[lo] if lo >= 0 else ''
+                                       for lo in locs]])]
+        components.append(list(radii))
         components.append(['form']*len(locs))
     return(list(zip(*components)))
 

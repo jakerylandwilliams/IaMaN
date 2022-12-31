@@ -6,17 +6,18 @@ from abc import ABC, abstractmethod
 from itertools import groupby
 from functools import reduce, partial
 from collections import Counter, defaultdict
-from .types import Dummy, Whatever, Token, Sentence, Document, Vocab, Cipher
+from .types import Dummy, Whatever, Token, Sentence, Document, Vocab, Cipher, Represent, Edgevec, Basis, Numvec
 from ..utils.fnlp import get_context, wave_index, get_wave
-from ..utils.munge import process_document, aggregate_processed, build_eots, count, detach, unroll, to_gpu
-from ..utils.stat import agg_vecs, blend_predictions
+from ..utils.munge import process_document, build_eots, count, detach, unroll, to_gpu, stick_spaces
+from ..utils.stat import agg_vecs, blend_predictions, noise, evaluate_segmentation, evaluate_tagging, merge_confusion, merge_accuracy, evaluate_document
+from pprint import pprint as pprint
 from ..utils.hr_bpe.src.bpe import HRBPE
-from ..utils.hr_bpe.src.utils import tokenize, sentokenize
+from ..utils.hr_bpe.src.utils import tokenize as tokenizer #, sentokenize
 from pyspark import SparkContext
 import pyspark
 
 conf = pyspark.SparkConf()
-conf.set('spark.local.dir', '/local-data/tmp/')
+conf.set('spark.local.dir', '/data/tmp/')
 
 # purpose: manages and executes all aspects of being of class language model (LM)
 # arguments: see __init__()
@@ -42,16 +43,18 @@ class LM(ABC):
     # - positional: 'dependent' or 'independent', setting the positional information model
     # - space: bool, with True allowing space (' ') tokens to operate on their own. False right-justifies text
     # - attn_type: list, with none, one, or two of the strings 'accumulating' or 'backward' for vector aggregation
-    # - do_ife: bool, with True mapping one-hots dimensions down to frequency-hot vectors
     # - runners: int, the number of map-reduce runners for data pre-processing
     # - hrbpe_kwargs: dict, of keyword arguments used to hyperparameterize LM-scoped hr-bpe tokenizers 
     # - gpu: bool, when True vectors and parameters move from numpy arrays to torch.cuda.current_device() tensors
-    # - bits: int or None, for dimensionality reduction; None defaults to one-hot (standard basis) vectors for the model's vocabulary W. bits cannot be smaller than log2(|W|), which the Cipher defaults to if set too low
+    # - device: str in ["cuda:0", ...]
+    # - bits: int, for dimensionality reduction; 0 implies one-hot (standard basis) vectors for the model's vocabulary W. for reduction, bits cannot be smaller than log2(|W|), which the Cipher defaults to if set too low. if bits is negative, one-hots are mapped down to frequency-hot vectors
     # output: un-trained model class with user-specified attributes and related helper attributes
-    def __init__(self, m = 10, tokenizer = 'hr-bpe', noise = 0.001, positionally_encode = True, seed = None, positional = 'dependent',
-                 space = True, attn_type = [False], do_ife = True, runners = 0, hrbpe_kwargs = {}, gpu = False, bits = None): 
+    def __init__(self, m = 10, tokenizer = 'hr-bpe', noise = 0.001, positionally_encode = True, seed = None, positional = 'dependent', space = True,
+                 attn_type = [False], runners = 0, hrbpe_kwargs = {}, gpu = False, ms = {}, bits = 0, ms_init = 'waiting_time', btype = 'nf', device = ''):  
         # set basic user-defined parameters for data handling and aggregation
-        self._runners = int(runners); self._gpu = bool(gpu)
+        self._runners = int(runners); self._gpu = bool(gpu); 
+        self._device = 'cpu' if not gpu else (torch.device(device if torch.cuda.is_available() else "cpu") 
+                                              if device else torch.cuda.current_device())
         self._seed = int(seed); self._space = bool(space); self._attn_type = list(attn_type)
         # set tokenizer-related parameters
         self._tokenizer_name = str(tokenizer)
@@ -62,39 +65,35 @@ class LM(ABC):
                                                      "\w[ ]*[*\(\{\[\)\}\]\.\?\!\,\;]"],
                                  } if not hrbpe_kwargs else dict(hrbpe_kwargs)
         # set context and dimensionality reduction parameters
-        self._bits = int(bits) if bits is not None else None
-        if do_ife and self._bits is None: # the user sets integer frequency encipherment
+        self._bits = int(bits); self._btype = btype; self._ms_init = ms_init; self._ms = ms
+        if self._bits < 0: # the user sets integer frequency encipherment
             self._cltype = 'frq'  
-        elif self._bits is not None: # the user sets bitvector encipherment
+        elif self._bits > 0: # the user sets bitvector encipherment
             self._cltype = 'bits'
         else: # the user defaults to one-hot encoding
             self._cltype = 'form'
-        self._cnull = 0 if ((self._cltype == 'frq') or (self._cltype == 'bits')) else ''
         # various flags that indicate the current model states and other model parameters 
         self._fine_tuned = False
         self._lorder = list(); self._ltypes = defaultdict(set) 
         if self._seed:
             np.random.seed(seed=self._seed)
         self._positional = str(positional); self._positionally_encode = bool(positionally_encode)
-        self._noise = noise; self._m = m; self._As = {}; self._Ls = {}
-        self._X = Counter(); self._F = Counter(); self._Xs = {}; self._Fs = defaultdict(Counter)
-        self._ife = Counter(); self._tru_ife = Counter(); self._f0 = Counter()
-        self._trXs = {}; self._trIs = {}
-        self._Tds, self._Tls = defaultdict(Counter), defaultdict(lambda : defaultdict(Counter))
-        self._D = defaultdict(set); self._L = defaultdict(lambda : defaultdict(set))
-        self._alphas = defaultdict(list); self._total_sentences = 0; self._total_tokens = 0; self._max_sent = 0
+        self._noise = noise; self._m = m; self._As = {}; self._Ls = {}; self._fs = defaultdict(Counter)
+        self._X = Counter(); self._F = Counter(); self._Xs = {}; self._Fs = defaultdict(Counter); self._trFs = defaultdict(Counter)
+        self._trXs = {}; self._trIs = {}; self._Tvs, self._Cvs = {}, {}; self._max_sent = 0
         # containers for processed data, as well as object constructors and object handling methods
         self._documents = []; self._sentences = []; self._tokens = []; self._whatevers = []
-        self.array = partial(torch.tensor, dtype = torch.double, device = torch.cuda.current_device()) if self._gpu else np.array
-        self.intarray = partial(torch.tensor, dtype = torch.long, device = torch.cuda.current_device()) if self._gpu else np.array
+        self.array = partial(torch.tensor, dtype = torch.double, device = self._device) if self._gpu else np.array
+        self.intarray = partial(torch.tensor, dtype = torch.long, device = self._device) if self._gpu else np.array
         self.long = partial(torch.tensor, dtype = torch.long) if self._gpu else np.array
         self.double = partial(torch.tensor, dtype = torch.double) if self._gpu else np.array
-        self.ones = partial(torch.ones, dtype = torch.double, device = torch.cuda.current_device()) if self._gpu else np.ones
-        self.zeros = partial(torch.zeros, dtype = torch.double, device = torch.cuda.current_device()) if self._gpu else np.zeros
+        self.ones = partial(torch.ones, dtype = torch.double, device = self._device) if self._gpu else np.ones
+        self.zeros = partial(torch.zeros, dtype = torch.double, device = self._device) if self._gpu else np.zeros
         self.cat = partial(torch.cat,  axis = -1) if self._gpu else np.concatenate
         self.log10 = torch.log10 if self._gpu else np.log10
         self.stack = torch.stack if self._gpu else np.array
         # self.view = lambda dims, vec: vec.view(*dims) if self._gpu else lambda dims, vec: vec.reshape(*dims)
+
     # purpose: trains an LM over a set of documents
     # arguments: 
     # - docs, a list (corpus) of lists documents of strings (sentences); 
@@ -105,7 +104,7 @@ class LM(ABC):
     # prereqs: minimally, user provide a set of sentence-tokenized documents and a name for the training corpus
     # effect: trains a 1- or 2-layer model, powering other class methods (e.g., generate or interpret)
     def fit(self, docs, docs_name, covering = [], all_layers = defaultdict(lambda : defaultdict(list)), 
-            fine_tune = False):
+            fine_tune = False, covering_vocab = set(), ms = {}):
         # assure all covering segmentations match their documents
         if covering:
             if not all([len("".join(s_c)) == len(s) for d_c, d in zip(covering, docs) for s_c, s in zip(d_c, d)]):
@@ -116,15 +115,14 @@ class LM(ABC):
                 all_layers = ({di: {ltype: all_layers[di][ltype] for ltype in all_layers[di] 
                                     if len(covering[di])} for di in all_layers} 
                               if all_layers else defaultdict(lambda : defaultdict(list)))
-        
         # train hr-bpe, if necessary
         if self._tokenizer_name == 'hr-bpe':
             if 'seed' not in self._hrbpe_kwargs:
                 self._hrbpe_kwargs['seed'] = self._seed
-            self._hrbpe_kwargs['covering'] = []; self._hrbpe_kwargs['covering_vocab'] = set()
+            self._hrbpe_kwargs['covering'] = []; self._hrbpe_kwargs['covering_vocab'] = covering_vocab
             if covering:
                 self._hrbpe_kwargs['covering'] = list([s for d in covering for s in d])
-                if 'covering_vocab' not in self._hrbpe_kwargs:
+                if not self._hrbpe_kwargs['covering_vocab']:
                     self._hrbpe_kwargs['covering_vocab'] = set([t for d in covering for s in d for t in s])
             self._hrbpe_kwargs['actions_per_batch'] = int(self._hrbpe_kwargs['batch_size']/1)    
             print("Training tokenizer...")
@@ -137,55 +135,64 @@ class LM(ABC):
                                **{kw: self._hrbpe_kwargs[kw] for kw in ['seed', 'actions_per_batch']})
         elif self._tokenizer_name == 'sentokenizer':
             self.tokenizer = Dummy()
-            self.tokenizer.tokenize = tokenize
-            self.tokenizer.sentokenize = sentokenize
+            self.tokenizer.tokenize = tokenizer
         else:
             self.tokenizer = Dummy()
             self.tokenizer.tokenize = lambda text: [t for t in re.split('( )', text) if t]
         # define the fit model's tokenizer method 
         def tokenize(text):
-            if self._space:
-                return self.tokenizer.tokenize(text)
-            else:
-                stream = list(self.tokenizer.tokenize(text))
-                tokens = []
-                for wi, w in enumerate(stream):
-                    if not tokens:
-                        tokens.append(w)
-                    elif w == ' ':
-                        if (tokens[-1][-1] != ' ') and (wi != len(stream)-1):
-                            tokens.append(w)
-                        else:
-                            tokens[-1] = tokens[-1] + w
-                    else:
-                        if tokens[-1][-1] == ' ':
-                            tokens[-1] = tokens[-1] + w
-                        else:
-                            tokens.append(w)
-                return(tuple(tokens))
+            stream = self.tokenizer.tokenize(text)
+            return(tuple(stream if self._space else stick_spaces(stream)))
         # attach the tokenizer
         self.tokenize = tokenize
         # tokenize documents and absorb co-occurrences
-        all_data, streams = self.process_documents(docs, all_layers, covering, fine_tune = fine_tune) 
-        # compute the marginals
-        print('Computing marginal statistics...')
-        self.compute_marginals()
-        # build dense models
-        print('Building dense output heads...')
-        self.build_dense_output(fine_tune = fine_tune) 
-        # build transition matrices for tag decoding
-        self.build_trXs(all_data)
-        # fine-tune a model for/using attention over predicted contexts
+        docs, layers, ltypes = self.process_documents(docs, all_layers, covering, fine_tune = fine_tune)
+        # build the base model
+        self.build_base_model(fine_tune = fine_tune, ms = ms)
         if fine_tune:
+            # encode streams
+            print('Encoding data streams...')
+            streams = self.encode_data(docs, layers, ltypes)
+            # fine-tune a model for/using attention over predicted contexts
             self.fine_tune(docs, covering = covering, all_layers = all_layers, streams = streams)
-        # report model statistics
-        print('Done.')
-        print('Model params, types, encoding size, contexts, vec dim, max sent, and % capacity used:', 
-              len(self._Fs[self._cltype]), len(self._ltypes['form']), len(self._ltypes[self._cltype]), 
-              len(self._con_vocs[self._cltype]), self._vecdim, self._max_sent,
-              round(100*len(self._Fs[self._cltype])/(len(self._con_vocs[self._cltype])*len(self._ltypes['form'])), 3))
-        
-        return streams
+            return streams
+        else:
+            return []
+            
+    def preprocess_data(self, docs, covering = [], all_layers = defaultdict(lambda : defaultdict(list)), 
+                        post_train = False, update = False):
+        # tokenize documents (once self.tokenize serializes, this should be handled by process_document)
+        if (covering and self._tokenizer_name == 'hr-bpe') or (not covering): print('Tokenizing documents...')
+        docs = ([[self.tokenize(s) for s in doc] for doc in tqdm(docs)] # json.dumps()
+                if (covering and self._tokenizer_name == 'hr-bpe') or (not covering) else [json.dumps(d) for d in covering])
+        all_data = list(map(json.dumps, zip(docs, [covering[d_i] if covering else [] for d_i in range(len(docs))], # docs and covering
+                                            [list(all_layers[d_i].keys()) for d_i in range(len(docs))], # ltypes
+                                            [list(all_layers[d_i].values()) for d_i in range(len(docs))]))) # layers
+        bc = {'m': int(self._m), 'post_train': post_train, 
+              'f': Counter({t[0]: self.rep._f[t] for t in self.rep._f}) if (post_train and not update) else Counter()}
+        print('Pre-processing data...')
+        docs, layers, ltypes = zip(*[process_document(doc_data, bc = bc)
+                                     for d_i, doc_data in tqdm(list(enumerate(all_data)))])
+#         if self._runners:
+#             sc = SparkContext(f"local[{self._runners}]", "IaMaN", self._runners, conf=conf)
+#             # SparkContext.setSystemProperty('spark.executor.memory', '1g')
+#             SparkContext.setSystemProperty('spark.driver.memory', '2g')
+#             bc = sc.broadcast(bc); batchsize = max([10*self._runners, int(len(all_data)/10)])
+#             docs, layers, ltypes = [], [], []
+#             for i in range(0,ceil(len(all_data)/batchsize) + 1):
+#                 batch = list(all_data[i*batchsize:(i+1)*batchsize])
+#                 if not batch: continue
+#                 # collecting pre-processed data
+#                 bdocs, blayers, bltypes = zip(*list(tqdm(sc.parallelize(batch)\
+#                                                            .map(partial(process_document, bc = bc), 
+#                                                                 preservesPartitioning=False).toLocalIterator())))
+#                 docs.extend(bdocs); layers.extend(blayers); ltypes.extend(bltypes)
+#             sc.stop()
+#         else:            
+#             # collect pre-processed data
+#             docs, layers, ltypes = zip(*[process_document(doc_data, bc = bc)
+#                                          for d_i, doc_data in tqdm(list(enumerate(all_data)))])
+        return docs, layers, ltypes
         
     ## now re-structured to train on layers by document
     # purpose: tokenize documents and absorb co-occurrences
@@ -199,121 +206,142 @@ class LM(ABC):
     # - post_train: bool, with True indicating that processing is for re-training the base-layer's model over additional documents
     # prereqs: not to be run by user, operated by system during .fit, .fine_tune, and .post_train methods
     # output: fully encoded data streams
-    def process_documents(self, docs, all_layers = defaultdict(lambda : defaultdict(list)), 
-                          covering = [], update_ife = False, update_bow = False, 
-                          fine_tune = False, post_train = False):
-        if (covering and self._tokenizer_name == 'hr-bpe') or (not covering): print('Tokenizing documents...')
-        docs = ([json.dumps([self.tokenize(s) for s in doc]) for doc in tqdm(docs)]
-                if (covering and self._tokenizer_name == 'hr-bpe') or (not covering) else [json.dumps(d) for d in covering])
-        d_is = range(len(docs))
-        all_data = list(zip(docs, [covering[d_i] if covering else [] for d_i in d_is], # docs and covering
-                            [list(all_layers[d_i].keys()) for d_i in d_is], # ltypes
-                            [list(all_layers[d_i].values()) for d_i in d_is])) # layers
-        Fs = []; old_ife = Counter(self._ife)
-        bc = {'m': int(self._m), 'old_ife': Counter(self._ife), 'post_train': post_train} # 'tokenizer': self.tokenize,
+    def process_documents(self, docs, all_layers = defaultdict(lambda : defaultdict(list)), covering = [], 
+                          update = False, fine_tune = False, post_train = False, max_char_per_batch = 100000):
+        # pre-process data
+        total_characters = np.cumsum([sum([len(s) for s in doc]) for doc in docs])
+        docs, layers, ltypes = self.preprocess_data(docs, covering, all_layers, post_train, update)
+        batch_nums = total_characters/max_char_per_batch
+        num_batches = int(ceil(batch_nums.max()))
+        start = 0; num_docs = len(docs); batches = []
+        for i in range(num_batches):
+            stop = np.arange(num_docs)[batch_nums <= (i+1)][-1]
+            batches.append(json.dumps([docs[start:stop], layers[start:stop], ltypes[start:stop]]))
+            start = stop
+        ##
+        # preprocessed = list(map(json.dumps, zip(docs, layers, ltypes)))
+        Fs = []; bc = {'m': int(self._m), 'post_train': post_train, # 'tokenizer': self.tokenize,
+                       'f': Counter({t[0]: self.rep._f[t] for t in self.rep._f}) if (post_train and not update) else Counter()} 
+        # count co-occurrences
         if self._runners:
             print('Counting documents and aggregating counts...')
             sc = SparkContext(f"local[{self._runners}]", "IaMaN", self._runners, conf=conf)
-#             SparkContext.setSystemProperty('spark.executor.memory', '1g')
-            SparkContext.setSystemProperty('spark.driver.memory', '2g')
+            SparkContext.setSystemProperty('spark.executor.memory', '2g')
+            SparkContext.setSystemProperty('spark.driver.memory', '8g')
             bc = sc.broadcast(bc)
-            Fs = Counter({ky: ct for (ky, ct) in tqdm(sc.parallelize(all_data)\
+            Fs = Counter({ky: ct for (ky, ct) in tqdm(sc.parallelize(batches)\
                                                         .flatMap(partial(count, bc = bc), preservesPartitioning=False)\
                                                         .reduceByKey(lambda a, b: a+b, numPartitions = int(len(docs)/10) + 1)\
-                                                        .toLocalIterator())})
-            print('Collecting pre-processed data...') # this should be mapped and collected with spark, as required
-            docs, dcons, layers, ltypes, metas = [], [], [], [], []
-            for i in range(0,ceil(len(all_data)/self._runners) + 1):
-                batch = list(all_data[i*self._runners:(i+1)*self._runners])
-                if not batch: continue
-                bdocs, bdcons, blayers, bltypes, bmetas = zip(*list(tqdm(sc.parallelize(batch)\
-                                                                           .map(partial(process_document, bc = bc), 
-                                                                                preservesPartitioning=False).toLocalIterator())))
-                docs.extend(bdocs); dcons.extend(bdcons); layers.extend(blayers); ltypes.extend(bltypes); metas.extend(bmetas)
+                                                        .toLocalIterator())}) # preprocessed -> batches
             sc.stop()
         else:
             print('Counting documents...')
-            all_Fs = [Counter({ky: ct for (ky, ct) in count([doc, cover, ltypes, layers], bc = bc)})
-                      for d_i, (doc, cover, ltypes, layers) in tqdm(list(enumerate(all_data)))]
+            all_Fs = [Counter({ky: ct for (ky, ct) in count(doc_data, bc = bc)}) 
+                      for d_i, doc_data in tqdm(list(enumerate(batches)))] # preprocessed
             print("Aggregating counts...")
             Fs = reduce(lambda a, b: a + b, tqdm(all_Fs))
-            print('Collecting pre-processed data...')
-            docs, dcons, layers, ltypes, metas = zip(*[process_document([doc, cover, ltypes, layers], bc = bc)
-                                                       for d_i, (doc, cover, ltypes, layers) in tqdm(list(enumerate(all_data)))])
-        print("Aggregating metadata...")
-        meta = reduce(aggregate_processed, tqdm(metas))
-        ## now modifies the model outside of the lower-level functions
-        self._total_sentences += meta['total_sentences']
-        self._total_tokens += meta['M']
-        for Mt in meta['alphas']:
-            for alpha in meta['alphas'][Mt]:
-                self._alphas[Mt].append(alpha)
-        for Td, Tl in zip(meta['Tds'], meta['Tls']):                
-            d_i = len(self._Tds)
-            self._Tds[d_i] = Td
-            for t in Td:
-                self._D[t].add(d_i)
-            for ltype in Tl:
-                for l in Tl[ltype]:
-                    self._Tls[ltype][l] += Tl[ltype][l]
-        for ltype in meta['L']:
-            for t in meta['L'][ltype]:
-                self._L[ltype][t] = self._L[ltype][t].union(meta['L'][ltype][t])
-        self._max_sent = max([meta['max_sent'], self._max_sent])
-        for ltype in meta['lorder']:
-            if ltype not in self._lorder: 
-                self._lorder.append(ltype)
-        if not self._f0 or update_bow:
-            self._f0 += meta['f0']
-            self._M0 = sum(self._f0.values())
-            self._p0 = Counter({t: self._f0[t]/self._M0 for t in self._f0})
+        ## store co-occurrence data
+        self._F += Fs
+        ##
+        print("Counting tag-tag transition frequencies...")
+        for dltypes, dlayers in tqdm(list(zip(ltypes, layers))):
+            for ltype, layer in zip(dltypes, dlayers):
+                lstream = [''] + [lt for ls in layer for lt in ls]
+                self._fs[ltype] += Counter(lstream[1:])
+                if ltype not in ['nov', 'iat', 'bot', 'eot', 'eos', 'eod', 'pos']: continue
+                self._trFs[ltype] += Counter(list(zip(lstream[:-1], lstream[1:])))
+                # self._trFs[ltype] += Counter(list(zip(lstream[1:], lstream[:-1])))
+        if self._space:
+            self._fs['form'] += Counter([t for doc in docs for s in doc for t in s])
+        else:
+            self._fs['form'] += Counter([t for doc in docs for s in doc for t in s]) #
+        ## build a representation for the input (context) space
+        if post_train and update:
+            self.rep.update_cipher([[(t, 'form') for s in doc for t in s] for doc in docs])
+        elif not post_train:
+            self.rep = Represent([[(t, 'form') for s in doc for t in s] for doc in docs] + [[('', 'oov')]], bits = self._bits, btype = self._btype)
+        if self._bits > 0:
+            self._fs['bits'] += Counter([int(b) for t in self._fs['form'] 
+                                         for b in self.rep.cipher.sparse_encipher((t, 'form')) 
+                                         for _ in range(self._fs['form'][t])])
+        self._max_sent = max([max([len(s) for d in docs for s in d]), self._max_sent])
+        self._lorder = list(sorted(set(self._lorder + [ltype for dltypes in ltypes for ltype in dltypes])))
+        
+        return docs, layers, ltypes
+    
+    def build_base_model(self, fine_tune, bits = None, ms = {}, ms_init = '', btype = ''):
+        # re-build the representation with defined values (otherwise use system set values)
+        self._btype = btype if btype else self._btype
+        self._ms_init = ms_init if ms_init else self._ms_init
+        self._bits = bits if bits is not None else self._bits
+        self.rep._bits_set = self._bits
+        self.rep.build_cipher(self.rep._bits_set, self._btype)
+        self._rep = {t: np.array(self.rep(t)) for t in self.rep._f} # cache the representation
+        self._rep[('', 'form')] = np.array(self.rep('')) # stores the 'edge' vector
+        if self._ms_init == 'waiting_time':
+            self._ms = {}
+            for ltype in self._fs:
+                fsum = sum(self._fs[ltype].values())
+                self._ms[ltype] = min([int(np.ceil(1/sum([(self._fs[ltype][t]/fsum)**2 for t in self._fs[ltype]]))), self._m])
+#             self._ms = {ltype: min([int(np.ceil(1/sum([(self._fs[ltype][t]/self.rep._M)**2 for t in self._fs[ltype]]))), self._m]) # int(np.ceil(1/sum([(self._fs[ltype][t]/self.rep._M)**2 for t in self._fs[ltype]]))) #
+#                         for ltype in self._fs}
+        else:
+            self._ms = {ltype: min([ms[ltype], self._m]) if ltype in ms else self._m 
+                        for ltype in self._fs}
+        # set the base model's parameters
+        self.set_base_parameters()
+        # build dense models
+        print('Building dense output heads...')
+        self.build_dense_output(fine_tune = fine_tune) 
+        # build transition matrices for tag decoding
+        self.build_trXs()
+        # report model statistics
+        print('Done.')
+        print('Model params, types, encoding size, contexts, vec dim, max sent, and % capacity used:', 
+              len(self._params['form']), len(self._ltypes['form']), len(self._ltypes[self._cltype]), 
+              self.rep._bits*(2*self._m + 1 if self._positional == 'dependent' else 1), self._vecdim, self._max_sent,
+              round(100*len(self._params['form'])/(self._numcon*len(self._ltypes['form'])), 3))
+            
+    def set_base_parameters(self):
+        self._numcon = self.rep._bits*(2*self._ms.get('form', self._m) + 1 if self._positional == 'dependent' else 1)
         ## start forming the vocabularies, aggregations, and layers thereof
         self._ltypes = defaultdict(set); self._ctypes = set()
-        self._ltypes['form'].add(''); self._ltypes['frq'].add(0)
-        if self._cltype == 'bits': self._ltypes['bits'].add(0)
-        if fine_tune and self._cltype == 'form':
-            self._ltypes['form-attn'].add('')
-        elif fine_tune and self._cltype == 'frq':
-            self._ltypes['frq-attn'].add(0)
-        elif fine_tune and self._cltype == 'bits':
-            self._ltypes['bits-attn'].add(0)
-        ## store the raw data
-        self._F += Fs
-        ## determines the integer frequencies for encipherment
-        if not self._ife or update_ife:
-            for t, c in Fs:
-                if c[-1] == 'form': 
-                    self._ife[c[0]] += Fs[(t,c)]
-            self._ife_tot = sum(self._ife.values())
-            self._ife[''] = 0
-        if self._cltype == 'bits':
-            print('Building cipher... ', end = '')
-            ## creates an n-bit cipher for the context vocabulary
-            self._cipher = Cipher([t for t, _ in self._ife.most_common()], self._bits)
-            print(' done.')
-        ## encode
-        self._Fs = defaultdict(Counter)        
+        self._Fs = defaultdict(lambda : defaultdict(lambda : [np.zeros(self.rep._bits) for _ in range(2*self._ms.get(ltype, self._m) + 1)]))
+        self._encodings = {ky: defaultdict(dict) for ky in ['target', 'context']}; self._params = defaultdict(set)
+        # self._T = defaultdict(Counter); self._C = Counter(); self._C_tot = 0; self._TCs = defaultdict(lambda : defaultdict(set))
         print("Encoding parameters...")
         for t, c in tqdm(self._F):
             ents, encs, intensity = self.encode(t, c)
             impact = intensity*self._F[(t,c)]
+            ltype = t[1]+'-'+c[-1] if c[-1] == 'attn' else t[1]
+            # self._TCs[ltype][t].add(c); self._T[ltype][t] += impact
+            if abs(c[1]) <= self._ms.get(ltype, self._m):
+                self._Fs[ltype][t][self._ms.get(ltype, self._m) + encs[0][1]] += impact*self._rep.get((c[0],'form'), self._rep[('', 'oov')])
+            if t == (True,'nov') and abs(c[1]) <= self._ms.get('form', self._m):
+                tltype = ltype; ltype = 'form'
+                self._Fs[ltype][('', 'oov')][self._ms.get(ltype, self._m) + encs[0][1]] += impact*self._rep.get((c[0],'form'), self._rep[('', 'oov')])
+                ltype = tltype
             for enc in encs:
-                ltype = t[1]+'-'+enc[-1] if enc[-1] == 'attn' else t[1]
-                if (self._positional == 'independent' and c[-1] == 'attn' and fine_tune) or (c[-1] != 'attn'):
-                    self._Fs[ltype][((t[0], ltype),enc)] += impact
-                    self._ltypes[ltype].add(t[0])
-                    self._ctypes.add(enc[-1])
-                    if enc[-1] == 'attn':
-                        self._ltypes['attn'].add(enc[0])
-                if t[1] == 'form':
-                    if (self._positional == 'independent' and enc[-1] == 'attn' and fine_tune) or (enc[-1] != 'attn'):
-                        for ent in ents:
-                            ltype = ent[1]+'-'+enc[-1] if enc[-1] == 'attn' else ent[1]; ent = (ent[0], ltype)
-                            self._Fs[ltype][(ent,enc)] += impact
-                            self._ltypes[ltype].add(ent[0])
-                            self._ctypes.add(enc[-1])
-                            if enc[-1] == 'attn':
-                                self._ltypes['attn'].add(enc[0])
+                self._params[ltype].add((t, enc))
+            if t[0] or (t[1] != 'form'):
+                self._ltypes[ltype].add(t[0])
+            self._ctypes.add(encs[0][-1])
+            if t[1] == 'form':
+                # self._C[c] += impact; self._C_tot += impact
+                for ent in ents: 
+                    ltype = ent[1]+'-'+encs[0][-1][-1] if encs[0][-1][-1] == 'attn' else ent[1]; ent = (ent[0], ltype)
+                    if abs(c[1]) <= self._ms.get(ltype, self._m):
+                        self._Fs[ltype][ent][self._ms.get(ltype, self._m) + encs[0][1]] += impact*self._rep.get((c[0],'form'), self._rep[('', 'oov')])
+                    for enc in encs:
+                        self._params[ltype].add((ent, enc))
+                    if ent[0]:
+                        self._ltypes[ltype].add(ent[0])
+            if encs[0][-1] == 'attn':
+                self._ltypes['attn'].add(encs[0][0])
+        # self._Fs['form'][('','oov')] = list(map(np.array, self._Fs['nov'][(True,'nov')])) # oovs now handled in the loop above
+        if self._gpu:
+            self._rep = {t: self.array(self._rep[t]) for t in self._rep}
+
         print('Building target vocabularies...')
         # sets the vocabularies according to the current accumulated collection of data in a unified way
         # these are the individual layers' vocabularies
@@ -321,50 +349,44 @@ class LM(ABC):
         for ltype in tqdm(self._ltypes):
             if ltype == 'attn': 
                 self._vocs[ltype] = Vocab([(t, ltype) for t in sorted(self._ltypes[ltype], key = lambda t: int(t))])
+            elif ltype == 'form':
+                self._vocs[ltype] = Vocab(sorted([(t, ltype) for t in self._ltypes[ltype]]) + [('','oov')])
+            elif ltype == 'bits':
+                self._vocs[ltype] = Vocab([(0,'bits')] + sorted([(t, ltype) for t in self._ltypes[ltype]]))
             else:
                 self._vocs[ltype] = Vocab(sorted([(t, ltype) for t in self._ltypes[ltype]]))
             self._zeds[ltype] = np.zeros(len(self._vocs[ltype]))
         print('Pre-computing BOW probabilities...', end = '')
         # set dense bow vector-probabilities for the language model to fall back to when contextless
         self._P0 = {}
-        self._P0['form'] = np.array([self._f0.get(t[0], 0) for t in self._vocs['form']])
-        self._P0['form'][self._vocs['form']._type_index[('', 'form')]] = 1
+        self._P0['form'] = np.array([self._fs['form'].get(t[0], 0) for t in self._vocs['form']]) # self._f0.get(t[0], 0)
         self._P0['form'] = self._P0['form']/self._P0['form'].sum()
-        f_ife = Counter()
-        for t in self._f0:
-            f_ife[self._ife[t]] += self._f0[t]
-        self._P0['frq'] = np.array([f_ife.get(t[0], 0) for t in self._vocs['frq']])
-        self._P0['frq'][self._vocs['frq']._type_index[(0, 'frq')]] = 1
-        self._P0['frq'] = self._P0['frq']/self._P0['frq'].sum()
+        if self._cltype == 'frq':
+            f_ife = Counter()
+            for t in self.rep._f:
+                f_ife[self.rep._f[t]] += self.rep._f[t]
+            self._P0['frq'] = np.array([f_ife.get(t, 0) for t in self._vocs['frq']])
+            self._P0['frq'] = self._P0['frq']/self._P0['frq'].sum()
         if self._cltype == 'bits':
             self._P0['bits'] = self.array(self._zeds['bits'])
             for t in self._vocs['form']:
-                bits = self._cipher.sparse_encipher(t[0])
+                bits = self.rep.cipher.sparse_encipher(t)
                 for bit in bits:
-                    self._P0['bits'][self._vocs['bits']._type_index[(int(bit), 'bits')]] += self._f0.get(t[0], 0)/len(bits)
+                    self._P0['bits'][self._vocs['bits']._type_index[(int(bit) + 1, 'bits')]] += self._fs['form'].get(t[0], 0)/len(bits) # self._f0.get(t[0], 0)
             self._P0['bits'] = self._P0['bits']/self._P0['bits'].sum()
         print(' done.')
-        print('Building context vocabularies...')
-        # these are the combined context vocabularies, which spread the vocabs across the entire (2m+1) positional range
-        self._con_vocs = defaultdict(list)
-        for ctype in tqdm(self._ctypes):
-            if self._positional == 'dependent':
-                self._con_vocs[ctype] = Vocab([(t,r,ltype) for r in range(-self._m,self._m+1) for t, ltype in self._vocs[ctype]], 
-                                              null = self._cnull)
-            else:
-                self._con_vocs[ctype] = Vocab([(t,0,ltype) for t, ltype in self._vocs[ctype]], 
-                                              null = self._cnull)
+
         print('Pre-computing wave amplitudes...', end = '')
         ## these are pre-computed for positional encoding
-        if self._positional == 'dependent': #  and (self._cltype != 'bits')
+        if self._positional == 'dependent':
             if self._cltype == 'bits':
-                self._positional_intensities = self.array(np.zeros(len(self._con_vocs[self._cltype])))
+                self._positional_intensities = self.array(np.zeros(self.rep._bits*(2*self._m + 1)))
                 for rad in range(-self._m,self._m+1):
                     for t, _ in self._vocs['form']:
-                        impact = self.intensity(t, abs(rad))
-                        _, encs, impact = self.encode(('', 'form'), (t, rad, 'form'))
-                        self._positional_intensities[self.long([self._con_vocs[self._cltype].encode(enc) 
-                                                                for enc in encs])] += impact/len(encs)
+                        intensity = self.intensity(t, abs(rad))
+                        _, encs, intensity = self.encode(('', 'form'), (t, rad, 'form'))
+                        start, stop = self.rep._bits*(rad + self._m), self.rep._bits*(rad + self._m + 1)
+                        self._positional_intensities[start:stop] += self._rep.get((t,'form'), self._rep[('', 'oov')])*intensity/len(encs)
                 self._positional_intensities /= self._positional_intensities.max()
             else:
                 self._positional_intensities = self.array([self.intensity(t, abs(rad)) for rad in range(-self._m,self._m+1) 
@@ -374,17 +396,17 @@ class LM(ABC):
                 self._positional_intensities = [self.array(np.zeros(len(self._vocs[self._cltype])))]*(2*self._m + 1)
                 for rad in range(-self._m,self._m+1):
                     for t, _ in self._vocs['form']:
-                        impact = self.intensity(t, abs(rad))
-                        _, encs, impact = self.encode(('', 'form'), (t, rad, 'form'))
+                        intensity = self.intensity(t, abs(rad))
+                        _, encs, intensity = self.encode(('', 'form'), (t, rad, 'form'))
                         self._positional_intensities[rad + self._m][self.long([self._vocs[self._cltype].encode(enc) 
-                                                                               for enc in encs])] += impact/len(encs)
+                                                                               for enc in encs])] += intensity/len(encs)
                 for ix in range(len(self._positional_intensities)):
                     self._positional_intensities[ix] /= self._positional_intensities[ix].max()
             else:
                 self._positional_intensities = [self.array([self.intensity(t, abs(rad)) for t, _ in self._vocs[self._cltype]])
                                                 for rad in range(-self._m,self._m+1)]
         else:
-            self._positional_intensities = self.array(np.zeros(len(self._con_vocs[self._cltype]))) + 1 
+            self._positional_intensities = self.array(np.zeros(self.rep._bits*(2*self._m + 1))) + 1
         print(' done.')
         print('Stacking output vocabularies for decoders...')
         # these are the combined output vocabulary (indexing the combined output vectors)
@@ -397,13 +419,6 @@ class LM(ABC):
             self._vecsegs[ltype] = (self._vecdim, self._vecdim + len(self._vocs[ltype]))
             self._vecdim += len(self._vocs[ltype])
             self._allvocs += list(self._vocs[ltype])
-        if post_train:
-            streams = []
-        else:
-            print('Encoding data streams for torch processing...')
-            streams = self.encode_data(docs, dcons, layers, ltypes)
-            print(' done.')    
-        return all_data, streams
 
     # purpose: determine encodings and their intensity for a type and context
     # arguments: 
@@ -412,7 +427,17 @@ class LM(ABC):
     # prereqs: not run by user, operated by system during .process_documents and .build_dense_output
     # output: lists of the encoded types, contexts, and their intensities of interaction
     def encode(self, t, c):
-        intensity = 1; ents = [None]
+        ltype = t[1]+'-'+c[-1] if c[-1] == 'attn' else t[1]
+        if t not in self._encodings['target'][ltype]:
+            self._encodings['target'][ltype][t] = self.encode_target(t)
+        if c not in self._encodings['context']['cons']:
+            self._encodings['context']['cons'][c] = self.encode_context(c)
+        ents = self._encodings['target'][ltype][t]
+        encs, intensity = self._encodings['context']['cons'][c]
+        return ents, encs, intensity
+    
+    def encode_context(self, c):
+        intensity = 1
         if self._positionally_encode:
             intensity *= self.intensity(c[0], abs(c[1]))
         encs = [c]
@@ -420,16 +445,22 @@ class LM(ABC):
             if self._cltype == 'frq':
                 encs = [self.if_encode_context(c)]
             elif self._cltype == 'bits':
-                encs = [(int(i), c[1], 'bits') for i in self._cipher.sparse_encipher(c[0])]
+                encs = [(int(i) + 1, c[1], 'bits') for i in self.rep.cipher.sparse_encipher((c[0], 'form'))
+                       ] if c[0] else [(0,c[1],'bits')]
             else:
                 encs = [c]
         if ('attn' in c[-1]) or (self._positional == 'independent'):
-            encs = [(enc[0], 0, enc[-1]) for enc in encs] # int(enc[1]/abs(enc[1]) if enc[1] else enc[1])
-        if t and t[1] == 'form': # [0]
-            ents = [(self._ife[t[0]], 'frq')]
+            encs = [(enc[0], 0, enc[-1]) for enc in encs]
+        return encs, intensity
+    
+    def encode_target(self, t):
+        ents = [None]
+        if t and t[1] == 'form':
+            ents = [(self.rep._f[t], 'frq')]
             if self._cltype == 'bits':
-                ents = [(int(i), 'bits') for i in self._cipher.sparse_encipher(t[0])]
-        return ents, encs, intensity
+                ents = [(int(i) + 1, 'bits') for i in self.rep.cipher.sparse_encipher((t[0], 'form'))]
+        return ents
+    
     # purpose: determine the amplitude of the wavefunction for co-occurrence weighting
     # arguments:
     # - c: int (integer frequency) or string (keying an integer frequency) in a bag of whatevers model (._p0)
@@ -440,8 +471,8 @@ class LM(ABC):
         if type(c) == int:
             theta = c/self._M0
         else:
-            theta = self._p0.get(c, 0)
-        return (np.cos((2*np.pi*dm*theta) if (c or type(c) == bool) else np.pi) + 1)/2
+            theta = self.rep._f.get(c,0)/self.rep._M
+        return (np.cos((2*np.pi*dm*theta)) + 1)/2 # if (c or type(c) == bool) else np.pi
     
     # purpose: map string-types to integer frequencies as a dimensionality reduction
     # arguments:
@@ -449,7 +480,7 @@ class LM(ABC):
     # prereqs: not run by user, operated by system during .encode
     # output: a tuple of three: (str, int, str) (see type c from .encode)
     def if_encode_context(self, c):
-        return(tuple([self._ife.get(c[0], 0), c[1], 'frq']))
+        return(tuple([self.rep._f.get((c[0],'form'), 0), c[1], 'frq']))
     
     # purpose: get a document-length vector of superimposed amplitudes based on its internal bag of whatevers distribution
     # arguments:
@@ -464,6 +495,17 @@ class LM(ABC):
                         for w in wav_f if w])
         else:
             return np.ones(len(doc))
+    
+    # purpose: manage the encoding of streams of all layer types for a corpus
+    # arguments:
+    # - docs: a corpus of sentence-tokenized documents (see .fit)
+    # - covering: a gold standard tokenization for the corpus (see .fit)
+    # - all_layers: multiple layers of gold standard tags (see .fit)
+    # prereqs: not run by user, operated by system during secondary/predictive (post .fit) exposures to data
+    # output: system scoped (cpu or gpu) and possibly multidimensional arrays of encoded streams of data
+    def encode_streams(self, docs, covering = [], all_layers = defaultdict(lambda : defaultdict(list))):
+        docs, layers, ltypes = self.preprocess_data(docs, covering, all_layers)
+        return self.encode_data(docs, layers, ltypes), docs
         
     # purpose: encode the corpus for rapid data loading (required for practical use of gpu-based processing)
     # arguments:
@@ -473,18 +515,20 @@ class LM(ABC):
     # - ltypes: list (corpus) of lists (documents) of lists (tag types)
     # prereqs: not run by user, operated by system during .process_documents
     # output: a list of data streams (see .encode_stream) for each input and output
-    def encode_data(self, docs, dcons, layers, ltypes):
+    def encode_data(self, docs, layers, ltypes):
         encoded = []
-        for doc, dcon, doc_layers, doc_ltypes in zip(docs, dcons, layers, ltypes):
+        for d_i, doc_ltypes in tqdm(list(enumerate(ltypes))):
+            doc_layers, doc = layers[d_i], docs[d_i]; d = unroll(doc)
+            dcon = [get_context(i, d, m = self._m) for i, t in enumerate(d)]
             encoded.append({'cons': self.encode_stream(dcon, 'cons'), # encode the context
                             'amps': self.encode_stream(dcon, 'amps'), # encode the context's wave amplitude
                             'm0ps': self.encode_stream(dcon, 'm0ps')}) # encode the context's sign of radius
-            encoded[-1]['form'] = self.encode_stream(unroll(doc), 'form') # encode the whatever types
+            encoded[-1]['form'] = self.encode_stream(d, 'form') # encode the whatever types
             for layer, ltype in zip(doc_layers, doc_ltypes): # iterate through the document's tag layers
                 encoded[-1][ltype] = self.encode_stream(unroll(layer), ltype) # encode the tag layer's types
-            encoded[-1]['amp'] = self.double(self.get_amps(unroll(doc))) # encode document aggregation weights
+            encoded[-1]['amp'] = self.double(self.get_amps(d)) # encode document aggregation weights
             if self._cltype == 'frq': # check if the frequency-context type requires encoding (for ife only)
-                encoded[-1]['frq'] = self.encode_stream(unroll(doc), 'frq') # encode the integer frequency
+                encoded[-1]['frq'] = self.encode_stream(d, 'frq') # encode the integer frequency
         return encoded
     
     # purpose: encode a stream of given layer type (ltype)
@@ -495,87 +539,15 @@ class LM(ABC):
     # output: a system scoped (cpu or gpu) and possibly multidimensional array of encoded stream data
     def encode_stream(self, stream, ltype):
         if ltype == 'cons':
-            # return [self.long([self._con_vocs[self._cltype].encode(self.encode(('', 'form'),c)[1]) 
-            #                    for c in cs]) for cs in stream]
-            return [self.long([self._con_vocs[self._cltype].encode(enc) 
-                               for c in cs for enc in self.encode(('', 'form'),c)[1]]) for cs in stream]
+            return [[c for c in cs] for cs in stream]
         elif ltype == 'amps':
-            # return [self.double([self.encode(('', 'form'),c)[-1] for c in cs]) for cs in stream]
-            return [self.double([amps/len(encs) # if enc[0] else 0.
-                                 for c in cs for _, encs, amps in [self.encode(('', 'form'),c)] 
-                                 for enc in encs]) for cs in stream]
+            return [self.double([self.encode(('', 'form'),c)[-1] for c in cs]) for cs in stream]
         elif ltype == 'm0ps':
-            return [self.long([int(c[1]/abs(c[1]) if c[1] else c[1])
-                               for c in cs for enc in self.encode(('', 'form'),c)[1]]) for cs in stream]
+            return [self.long([int(c[1]/abs(c[1]) if c[1] else c[1]) for c in cs]) for cs in stream]
         elif ltype == 'frq':
-            return self.long([self._vocs[ltype].encode((self._ife[t[0]], ltype)) for t in stream])
+            return self.long([self._vocs[ltype].encode((self.rep._f[t], ltype)) for t in stream])
         else:
             return self.long([self._vocs[ltype].encode((t, ltype)) for t in stream])
-    
-    # purpose: manage the encoding of streams of all layer types for a corpus
-    # arguments:
-    # - docs: a corpus of sentence-tokenized documents (see .fit)
-    # - covering: a gold standard tokenization for the corpus (see .fit)
-    # - all_layers: multiple layers of gold standard tags (see .fit)
-    # prereqs: not run by user, operated by system during secondary/predictive (post .fit) exposures to data
-    # output: system scoped (cpu or gpu) and possibly multidimensional arrays of encoded streams of data
-    def encode_streams(self, docs, covering = [], all_layers = defaultdict(lambda : defaultdict(list))):
-        # tokenize documents
-        docs = ([json.dumps([self.tokenize(s) for s in doc]) for doc in docs]
-                if (covering and self._tokenizer_name == 'hr-bpe') or (not covering) else [json.dumps(d) for d in covering])
-        d_is = range(len(docs))
-        all_data = list(zip(docs, [covering[d_i] if covering else [] for d_i in d_is], # docs and covering
-                            [list(all_layers[d_i].keys()) for d_i in d_is], # ltypes
-                            [list(all_layers[d_i].values()) for d_i in d_is])) # layers
-        bc = {'m': int(self._m), 'old_ife': Counter(self._ife), 'post_train': False}
-        if self._runners:
-            sc = SparkContext(f"local[{self._runners}]", "IaMaN", self._runners, conf=conf)
-            # SparkContext.setSystemProperty('spark.executor.memory', '1g')
-            SparkContext.setSystemProperty('spark.driver.memory', '2g')
-            bc = sc.broadcast(bc)
-            docs, dcons, layers, ltypes, metas = [], [], [], [], []
-            for i in range(0,ceil(len(all_data)/self._runners) + 1):
-                batch = list(all_data[i*self._runners:(i+1)*self._runners])
-                if not batch: continue
-                # collecting pre-processed data
-                bdocs, bdcons, blayers, bltypes, bmetas = zip(*list(tqdm(sc.parallelize(batch)\
-                                                                           .map(partial(process_document, bc = bc), 
-                                                                                preservesPartitioning=False).toLocalIterator())))
-                docs.extend(bdocs); dcons.extend(bdcons); layers.extend(blayers); ltypes.extend(bltypes); metas.extend(bmetas)
-            sc.stop()
-        else:            
-            # collect pre-processed data
-            docs, dcons, layers, ltypes, metas = zip(*[process_document([doc, cover, ltypes, layers], bc = bc)
-                                                       for d_i, (doc, cover, ltypes, layers) in list(enumerate(all_data))])
-        streams = self.encode_data(docs, dcons, layers, ltypes)
-        return streams, docs
-        
-    # purpose: compute marginal co-occurrence statistics used in the analytic noise model
-    # arguments: NA, calculations are based on the existence of cached co-occurrences within self._Fs
-    # prereqs: not run by user, operated by system during process_documents
-    # output: NA, function builds system parameters (statistics) used in balancing noise for sparsity handling
-    def compute_marginals(self):
-        numcon = len(self._con_vocs[self._cltype])
-        self._beta, self._zeta, self._Tn, self._Cn, self._Tvs, self._Cvs = {}, {}, {}, {}, {}, {}
-        for ltype in tqdm(self._Fs):
-            T = Counter(); C = Counter(); C_tot = 0
-            TCs = defaultdict(set); CTs = defaultdict(set)
-            ctype = 'attn' if 'attn' in ltype else self._cltype
-            for t, c in self._Fs[ltype]:
-                T[t] += self._Fs[ltype][(t,c)]; C[c] += self._Fs[ltype][(t,c)]
-                C_tot += self._Fs[ltype][(t,c)]; TCs[t].add(c); CTs[c].add(t)
-            numtok = len(T); # numcon = len(C); 
-            self._Tvs[ltype] = self.array([T.get(t,1.) for t in self._vocs[ltype]])
-            if ctype not in self._Cvs: self._Cvs[ctype] = self.array([C.get(c,1.) for c in self._con_vocs[ctype]])
-            Cp = {t: sum([C[c] for c in TCs[t]] + [0]) for t in T}
-            Tp = {c: sum([T[t] for t in CTs[c]] + [0]) for c in C}
-            self._beta[ltype] = defaultdict(lambda : 0., {t: Cp[t]/C_tot for t in T})
-            self._zeta[ltype] = defaultdict(lambda : 0., {c: Tp[c]/C_tot for c in C})
-            self._Cn[ltype] = defaultdict(lambda : numcon, {t: numcon - len(TCs[t]) for t in T})
-            self._Tn[ltype] = defaultdict(lambda : numtok, {c: len(T) - len(CTs[c]) for c in C})
-            if ltype == 'form':
-                self._f = Counter({t[0]: T[t] for t in T if t[1] == 'form'}); self._f[''] = 1
-                self._M = sum(self._f.values())
                 
     # purpose: wrap the construction of first-order parameter matrices for the system's current store of co-occurrences (in self._Fs)
     # arguments: fine_tune: bool, see .process_documents, used to restrict the construction of second order parameter matrices
@@ -584,31 +556,31 @@ class LM(ABC):
     def build_dense_output(self, fine_tune = False):
         for ltype in tqdm(self._Fs):
             ctype = 'attn' if 'attn' in ltype else self._cltype
-            fl = Counter(); cl = Counter()
-            for t, c in self._Fs[ltype]:
-                fl[t] += self._Fs[ltype][(t,c)]
-                cl[c] += self._Fs[ltype][(t,c)]
             # first build the emission matrices
-            X = np.zeros((len(self._vocs[ltype]), len(self._con_vocs[ctype])))
-            for i in range(X.shape[0]): ## add the negative information
-                if self._Cn[ltype][self._vocs[ltype][i]]:
-                    X[i,:] = (1 - self._beta[ltype][self._vocs[ltype][i]]
-                              )/self._Cn[ltype][self._vocs[ltype][i]]
-            for t, c in self._Fs[ltype]: ## add the positive information
-                X[self._vocs[ltype]._type_index[t], self._con_vocs[ctype]._type_index[c]] = self._beta[ltype][t]*self._Fs[ltype][(t,c)]/fl[t]
-            X[X==0] = self._noise; X /= X.sum(axis = 1)[:,None]; X = np.nan_to_num(-np.log10(X))
-            self._Xs[ltype] = self.array(X); del(X)
-            if fine_tune and (ltype == self._cltype or ctype == 'attn'):
+            X = np.zeros((len(self._vocs[ltype]), self.rep._bits*(2*self._ms.get(ltype, self._m) + 1) if self._positional == 'dependent' else self.rep._bits))
+            for t in self._Fs[ltype]: ## add the positive information
+                X[self._vocs[ltype].encode(t),:] = (np.concatenate(self._Fs[ltype][t]) if self._positional == 'dependent' else 
+                                                    np.array(self._Fs[ltype][t][self._ms.get(ltype, self._m)]))
+            if ltype == 'form': # this re-normalizes to the appropraite mass for the number of observerable training oovs
+                X *= (self.rep._M - len(self.rep._f))/self.rep._M
+                X[self._vocs['form'].encode(('','oov')),:] *= len(self.rep._f)/(self.rep._M - len(self.rep._f))
+            X[X==0] = self._noise
+            self._Tvs[ltype] = self.array([f[0] for f in X.sum(axis = 1)[:,None]])
+            # self._Cvs[ctype] = self.array(X.sum(axis = 0))
+            self._Cvs[ltype] = self.array(X.sum(axis = 0))
+            if self._positional == 'dependent':
+                self._Xs[ltype] = np.array(X)
+                for segment in range(2*self._ms.get(ltype, self._m) + 1):
+                    start, end = self.rep._bits*segment, self.rep._bits*(segment + 1)
+                    self._Xs[ltype][:,start:end] = (lambda M: np.nan_to_num(-np.log10(M/M.sum(axis = 1)[:,None])))(self._Xs[ltype][:,start:end])
+                self._Xs[ltype] = self.array(self._Xs[ltype])
+            else:
+                self._Xs[ltype] = self.array((lambda M: np.nan_to_num(-np.log10(M/M.sum(axis = 1)[:,None])))(X)) 
+            if fine_tune and (ltype == self._cltype or 'attn' in ltype):
                 # now build the transition matrices
-                A = np.zeros((len(self._vocs[ltype]), len(self._con_vocs[ctype])))
-                for j in range(A.shape[1]): ## add the negative information
-                    if self._Tn[ltype][self._con_vocs[ctype][j]]:
-                        A[:,j] = (1 - self._zeta[ltype][self._con_vocs[ctype][j]])/self._Tn[ltype][self._con_vocs[ctype][j]]
-                for t, c in self._Fs[ltype]: ## add the positive information
-                    A[self._vocs[ltype]._type_index[t], self._con_vocs[ctype]._type_index[c]] = self._zeta[ltype][c]*self._Fs[ltype][(t,c)]/cl[c]
-                A[A==0] = self._noise; A /= A.sum(axis = 0); A = np.nan_to_num(-np.log10(A))
-                self._As[ltype] = self.array(A); del(A)
-                
+                self._As[ltype] = self.array((lambda M: np.nan_to_num(-np.log10(M/M.sum(axis = 0))))(X))
+            del(X)
+            
     # purpose: re-trains a previously-trained single-layer model by refining model.fit() parameters with additional documents
     # arguments: 
     # - ptdocs: a list (corpus) of lists (documents) of lists (sentences). (see .fit for further details)
@@ -617,63 +589,36 @@ class LM(ABC):
     # - fine_tune: bool, with True indicating that sparse poritions of the 2-layer, attention-based model should be updated as well, i.e., which means that the .fine_tune method will likely be used afterwards to re-train the second order model away from ptdocs and towards a small target set.
     # prereqs: requires a previously-trained model to exist and be updated. intended for use in densification of first order models, and thus refined second order models. for low-footprint models, use should train an initial model using .fit on the target (gold standard) training set. following this, .post_train should be used to densify the statistics of the target inputs and outputs using external data  (ptdocs).
     # output: a re-trained model, potentially in need of being .fine_tune()'ed on target data.
-    def post_train(self, ptdocs, update_ife = False, update_bow = False, fine_tune = False):
+    def post_train(self, ptdocs, update = False, fine_tune = False, bits = None, ms = {}, ms_init = '', btype = ''): 
         if ptdocs:
             ptdocs = [["".join(s) for s in d] for d in ptdocs]
             print("Processing post-training documents...")
-            ptdata, ptstreams = self.process_documents(ptdocs, update_ife = update_ife, update_bow = update_bow, post_train = True)
-            print("Re-computing marginal statistics...")
-            self.compute_marginals()
-            print("Re-building dense output heads...")
-            self.build_dense_output(fine_tune = fine_tune)
-            # report model statistics
-            print('Done.')
-            print('Model params, types, encoding size, contexts, vec dim, max sent, and % capacity used:', 
-                  len(self._Fs[self._cltype]), len(self._ltypes['form']), len(self._ltypes[self._cltype]), 
-                  len(self._con_vocs[self._cltype]), self._vecdim, self._max_sent,
-                  round(100*len(self._Fs[self._cltype])/(len(self._con_vocs[self._cltype])*len(self._ltypes['form'])), 3))
+            self.process_documents(ptdocs, update = update, post_train = True)
+            # build the base model
+            self.build_base_model(fine_tune = fine_tune, bits = bits, ms = ms, ms_init = ms_init, btype = btype)
 
-    # purpose: builds transition matrices for token-level viterbi decoding of tags
+    # purpose: builds transition matrices for viterbi decoding of tags
     # arguments: all_data: list (corpus) of lists (documents) of lists (layers) of lists (sentences) of strings (whatevers or tags)
     # prereqs: not a user-run function, requires a processed (including tokenized) corpus of data
     # output: parameter matrix attributes are stored within the object for later use in decoding within the .interpret method
-    def build_trXs(self, all_data): # viterbi decoding will work best with token-level transitions
-        print("Counting for transition matrices...")
-        self._trFs = defaultdict(Counter)
-        for d_i, (doc, cover, ltypes, layers) in tqdm(list(enumerate(all_data))):          
-            for ltype, layer in zip(ltypes, layers):
-                lstream = [''] + [lt for ls in layer for lt in ls]
-                self._trFs[ltype] += Counter(list(zip(lstream[1:], lstream[:-1])))
-            d, _, layers, ltypes, _ = process_document((doc, cover, ltypes, layers), bc = {'m': int(self._m), 
-                                                                                           'old_ife': Counter(self._ife), 
-                                                                                           'post_train': False})
-            for ltype, layer in zip(ltypes, layers):
-                if ltype not in ['nov', 'iat', 'bot', 'eot', 'eos', 'eod']: continue
-                lstream = [''] + [lt for ls in layer for lt in ls]
-                self._trFs[ltype] += Counter(list(zip(lstream[1:], lstream[:-1])))
-        print("Building transition matrices for Viterbi tag decoding...")
+    def build_trXs(self): # viterbi decoding for tag-tag transitions
+        print("Building transition matrices for tag-sequence decoding...")
         for ltype in tqdm(self._trFs):
-            fl = Counter()
             self._trXs[ltype] = np.zeros((len(self._vocs[ltype]), len(self._vocs[ltype])))
-            self._trIs[ltype] = np.zeros(len(self._vocs[ltype]))
-            for t, c in self._trFs[ltype]: 
-                if c:
-                    fl[t] += self._trFs[ltype][(t,c)]
-                else:
-                    self._trIs[ltype][self._vocs[ltype]._type_index[(t, ltype)]] += self._trFs[ltype][(t,c)]
-            self._trIs[ltype] /= self._trIs[ltype].sum() # record the initial state probabilities
             for t, c in self._trFs[ltype]: ## add the positive information
-                if not c: continue
+                if ((not c) or (not t)) and ((type(t) == str) or (type(c) == str)): continue
                 self._trXs[ltype][self._vocs[ltype]._type_index[(t, ltype)], 
-                                  self._vocs[ltype]._type_index[(c, ltype)]] = self._beta[ltype][(t, ltype)]*self._trFs[ltype][(t,c)]/fl[t]
-            for j in range(self._trXs[ltype].shape[1]): ## add the negative information
-                zees = self._trXs[ltype][:,j] == 0.; Cn = sum(zees)
-                nonz = self._trXs[ltype][:,j] != 0.; Cp = sum(nonz)
+                                  self._vocs[ltype]._type_index[(c, ltype)]] = self._trFs[ltype][(t,c)]
+            self._trIs[ltype] = (lambda x: x/x.sum())(np.array([f[0] for f in self._trXs[ltype].sum(axis = 1)[:,None]]))
+            self._trXs[ltype] = (lambda M: M/M.sum(axis = 1)[:,None])(self._trXs[ltype])
+            for i in range(self._trXs[ltype].shape[0]): ## add the negative information
+                zees = self._trXs[ltype][i,:] == 0.; Cn = sum(zees)
+                nonz = self._trXs[ltype][i,:] != 0.; Cp = sum(nonz)
                 bet = Cp/(Cn + Cp)
                 if Cn: 
-                    self._trXs[ltype][zees,j] = (1 - bet)/Cn
-                    self._trXs[ltype][nonz,j] *= bet
-                self._trXs[ltype][:,j] /= self._trXs[ltype][:,j].sum()
+                    self._trXs[ltype][i, zees] = (1 - bet)/Cn
+                    self._trXs[ltype][i, nonz] *= bet
+                self._trXs[ltype][i,:] /= self._trXs[ltype][i,:].sum()
 
     # purpose: abstracts inner products, in-line with the used computational framework
     # arguments: 
@@ -725,11 +670,18 @@ class LM(ABC):
     # prereqs: a trained first-order model (also used in second-order models), obtained after running .fit
     # output: a concatenation of prediction vectors in the order of layers specified by ltypes
     def P1(self, amps, cons, ltypes):
-        Ps = []; Csum = (self._Cvs[self._cltype][cons]*amps).sum()
+        Ps = []
+        h = self.array(self.cat([amp*self._rep.get((con[0],'form'), self._rep[('', 'oov')]) for amp, con in zip(amps, cons)]) 
+                       if self._positional == 'dependent' else
+                       sum([amp*self._rep.get((con[0],'form'), self._rep[('', 'oov')]) for amp, con in zip(amps, cons)]))
         for ltype in ltypes:
-            Ps.append((amps*self._Xs[ltype][:,cons]).sum(axis = 1))
-            Ps[-1] -= self.log10(self._Tvs[ltype]/Csum)
-            Ps[-1] = 10**-(Ps[-1] - Ps[-1].min()); Ps[-1] /= Ps[-1].sum()
+            start = (self._m - self._ms.get(ltype, self._m))
+            stop = (self._m - self._ms.get(ltype, self._m)) + 2*self._ms.get(ltype, self._m) + 1
+            hl = h[self.rep._bits*start:self.rep._bits*stop] if self._positional == 'dependent' else h
+            Ps.append((lambda y: y/y.sum())((lambda x: 10**-(x - x.min()))(
+                self.dot(self._Xs[ltype], hl) - self.log10(self._Tvs[ltype]/
+                                                          (self.dot(self._Cvs[ltype], hl)).sum()) # self._cltype
+            )))
         return self.cat(Ps)
 
     # purpose: manage the computation of first order predictions (a representation) for a stream of data
@@ -751,9 +703,9 @@ class LM(ABC):
             ltypes = list(self._lorder) 
         for wi in range(len(vecs),len(stream['amps'])):
             amps, cons, m0ps = (self.double(detach(stream['amps'][wi])), 
-                                self.long(detach(stream['cons'][wi])),
+                                detach(stream['cons'][wi]), # self.long(detach(stream['cons'][wi])),
                                 self.long(detach(stream['m0ps'][wi])))
-            if self._gpu: amps, cons = to_gpu(amps), to_gpu(cons)
+            if self._gpu: amps = to_gpu(amps) # amps, cons = to_gpu(amps), to_gpu(cons)
             if not forward:
                 for ci, m0p in enumerate(m0ps):
                     if m0p >= 0:
@@ -780,7 +732,9 @@ class LM(ABC):
     def fine_tune(self, docs, covering = [], all_layers = defaultdict(lambda : defaultdict(list)), streams = []):
         if not streams:
             streams, _ = self.encode_streams(docs, covering = covering, all_layers = all_layers)
-        self._Ls = {ltype: self.array(np.zeros((len(self._vocs[ltype]), len(self._con_vocs[self._cltype])))) 
+        self._Ls = {ltype: 
+                    self.zeros((len(self._vocs[ltype]), self.rep._bits*(2*self._ms.get(ltype, self._m) + 1) if self._positional == 'dependent' else self.rep._bits))
+                    # self.array(np.zeros((len(self._vocs[ltype]), len(self._con_vocs[self._cltype])))) 
                     for ltype in self._ltypes}
         print("Fine-tuning dense output heads...")
         for stream in tqdm(streams):
@@ -789,13 +743,16 @@ class LM(ABC):
             avecs = self.attend(cvecs)
             ## these should be stacked and applied to a contiguous portion of the dense distribution
             for wi, (amps, cons) in enumerate(zip(stream['amps'], stream['cons'])):
-                if self._gpu: amps, cons = to_gpu(amps), to_gpu(cons)
+                if self._gpu: amps = to_gpu(amps) # amps, cons = to_gpu(amps), to_gpu(cons)
                 # the likelihood context vector from all positional predictions
-                dcv = self.dense_context(amps, cons, avecs, wi)
+                h = self.dense_context(amps, cons, avecs, wi)
                 for ltype in self._Ls:
+                    start = (self._m - self._ms.get(ltype, self._m))
+                    stop = (self._m - self._ms.get(ltype, self._m)) + 2*self._ms.get(ltype, self._m) + 1
+                    hl = h[self.rep._bits*start:self.rep._bits*stop] if self._positional == 'dependent' else h
                     if ltype not in stream: #  or ltype == 'form' # this implies uniform params in Ls['form']!
                         continue
-                    self._Ls[ltype][stream[ltype][wi],:] += dcv
+                    self._Ls[ltype][stream[ltype][wi],:] += hl
         for ltype in self._Ls:
             self._Ls[ltype][self._Ls[ltype]==0] = self._noise
             self._Ls[ltype] /= self._Ls[ltype].sum(axis=1)[:,None]
@@ -813,8 +770,8 @@ class LM(ABC):
         avecs = [] + previous_avecs
         for wi in range(len(avecs), len(cvecs)):
             cmax = len(cvecs) if forward else wi + 1
-            a = self.array(np.zeros(len(self._con_vocs[self._cltype]))) + 1
-            dcv = self.array(np.zeros(len(self._con_vocs[self._cltype]))) # note this sets and keeps zero
+            a = self.array(np.zeros(self.rep._bits*(2*self._ms.get(self._cltype, self._m) + 1))) + 1 
+            dcv = self.array(np.zeros(self.rep._bits*(2*self._ms.get(self._cltype, self._m) + 1))) 
             if self._positional == 'independent':
                 # gather the (2*m+1)-location positional attention distribution
                 pa = self.dot(self._As[self._cltype+'-attn'].T, cvecs[wi])
@@ -824,12 +781,15 @@ class LM(ABC):
                 sa = self.dot(self._As[self._cltype].T, cvecs[wi])
                 sa = 10**-(sa - sa.max())
                 if sa.sum(): sa = sa/sa.sum()
-                avec = sum([cvecs[ci]*pa[ci-wi+self._m]*sa*self._positional_intensities[ci-wi+self._m] 
-                            for ci in range(max([wi-self._m, 0]), min([wi+self._m+1, len(cvecs[:cmax])]))])
+                avec = sum([(cvecs[ci]*pa[ci-wi+self._ms.get(self._cltype+'-attn', self._m)]*
+                             sa*self._positional_intensities[ci-wi+self._ms.get(self._cltype+'-attn', self._m)])
+                            for ci in range(max([wi-self._ms.get(self._cltype+'-attn', self._m), 0]), 
+                                            min([wi+self._ms.get(self._cltype+'-attn', self._m)+1, len(cvecs[:cmax])]))])
             elif self._positional == 'dependent':
-                window = np.array(range(max([wi-self._m, 0]),min([wi+self._m+1, len(cvecs[:cmax])])))
+                window = np.array(range(max([wi-self._ms.get(self._cltype, self._m), 0]),
+                                        min([wi+self._ms.get(self._cltype, self._m)+1, len(cvecs[:cmax])])))
                 radii = window - wi
-                mindex = self._m + radii[0]
+                mindex = self._ms.get(self._cltype, self._m) + radii[0]
                 mincol = mindex*len(self._vocs[self._cltype])
                 maxcol = mincol + len(window)*len(self._vocs[self._cltype])
                 # concatenate the likelihood context vector from all positional predictions
@@ -837,7 +797,7 @@ class LM(ABC):
                 dcv[mincol:maxcol] *= self.array(detach(self._positional_intensities[mincol:maxcol]))
                 a = self.dot(self._As[self._cltype].T, cvecs[wi])
                 a = 10**-(a - a.max()); a /= a.sum(); dcv *= a
-                avec = self.view((2*self._m + 1,len(self._vocs[self._cltype])), dcv).sum(axis = 0)
+                avec = self.view((2*self._ms.get(self._cltype, self._m) + 1, self.rep._bits), dcv).sum(axis = 0)
             avecs.append(avec/avec.sum())
         return avecs
 
@@ -850,26 +810,26 @@ class LM(ABC):
     # prereqs: not user-driven, see .fine_tune for implicit use
     # output: an array of comtext-dimensionality
     def dense_context(self, amps, cons, avecs, wi): 
-        dcv = self.array(np.zeros(len(self._con_vocs[self._cltype])))
+        dcv = self.array(np.zeros(self.rep._bits*(2*self._m + 1)))
         window = self.long(range(max([wi-self._m, 0]),min([wi+self._m+1, len(avecs)])))
         radii = window - wi 
         mindex = self._m + radii[0]
-        mincol = mindex*len(self._vocs[self._cltype])
-        maxcol = mincol + len(window)*len(self._vocs[self._cltype])
+        mincol = mindex*self.rep._bits 
+        maxcol = mincol + len(window)*self.rep._bits
         if self._positional == 'independent':
             dcv += sum(avecs[window[0]:window[-1]+1])
-            # dcv[mincol:maxcol] += sum(avecs[window[0]:window[-1]+1])
+            h = sum([amp*self._rep.get((c[0],'form'), self._rep[('', 'oov')])
+                     for c, amp in zip(cons, amps)])
         elif self._positional == 'dependent':
             dcv[mincol:maxcol] += self.cat(avecs[window[0]:window[-1]+1])
-        # dcv[cons] += amps
+            h = self.cat([amp*self._rep.get((c[0],'form'), self._rep[('', 'oov')])
+                          for c, amp in zip(cons, amps)])
         dcvsum = dcv.sum(); ampssum = amps.sum() # maybe only needed to stabilize non-generative tasks?
         if dcvsum:
             if ampssum:
-                dcv = dcv*ampssum/dcvsum
-                dcv[cons] += amps; dcv /= 2
-                # dcv[cons] += amps*dcvsum/amps.sum(); dcv /= 2
+                dcv = (dcv*ampssum/dcvsum + h)/2
         else:
-            dcv[cons] = amps
+            dcv = h
         return dcv
 
     # purpose: produce second-order prediction for a stream of data at a point (wi)
@@ -883,15 +843,16 @@ class LM(ABC):
     # prereqs: not user driven (see .R2), requires a trained second-order model using .fit(..., fine_tune = True)
     # output: a prediction vectors for those layer types indicated in ltypes
     def P2(self, amps, cons, avecs, wi, ltypes, dense_predict):
-        dcv = self.dense_context(amps, cons, avecs, wi)
-        Ps = []; Csum = self.dot(dcv, self._Cvs[self._cltype])
+        h = self.dense_context(amps, cons, avecs, wi)
+        Ps = []
         for ltype in ltypes:
-            if dense_predict:
-                Ps.append(self.dot(self._Xs[ltype], dcv))
-            else:
-                Ps.append(self.dot(self._Ls[ltype], dcv))
-            Ps[-1] -= self.log10(self._Tvs[ltype]/Csum)
-            Ps[-1] = 10**-(Ps[-1] - Ps[-1].min()); Ps[-1] /= Ps[-1].sum()
+            start = (self._m - self._ms.get(ltype, self._m))
+            stop = (self._m - self._ms.get(ltype, self._m)) + 2*self._ms.get(ltype, self._m) + 1
+            hl = h[self.rep._bits*start:self.rep._bits*stop] if self._positional == 'dependent' else h
+            Ps.append((lambda y: y/y.sum())((lambda x: 10**-(x - x.min()))(
+                self.dot(self._Xs[ltype] if dense_predict else self._Ls[ltype], 
+                         hl) - self.log10(self._Tvs[ltype]/(self.dot(self._Cvs[ltype], hl)).sum()) # self._cltype
+            )))
             # note the next step applies the 'residual' connection from self.P1)
             Ps[-1] = Ps[-1] + self.P1(amps, cons, [ltype]); Ps[-1] /= Ps[-1].sum() 
         return self.cat(Ps)
@@ -915,10 +876,10 @@ class LM(ABC):
         ##
         for wi in range(len(vecs), len(stream['amps'])):
             amps, cons, m0ps = (self.double(detach(stream['amps'][wi])), 
-                                self.long(detach(stream['cons'][wi])),
+                                stream['cons'][wi],
                                 self.long(detach(stream['m0ps'][wi])))
             if self._gpu:
-                amps, cons = to_gpu(amps), to_gpu(cons)
+                amps = to_gpu(amps) 
             if not forward:
                 for ci, m0p in enumerate(m0ps):
                     if m0p >= 0:
@@ -995,33 +956,28 @@ class LM(ABC):
     # output: a list of decoded tags (strings)
     def viterbi(self, vecs, ltype):
         # start off the chain of probabilities 
-        V = [{}]; segsum = sum(vecs[0][self._vecsegs[ltype][0]:self._vecsegs[ltype][1]])
-        for t in self._vocs[ltype]:
-            V[0][t] = {"P": (self._trIs[ltype][self._vocs[ltype]._type_index[t]] * # initial state
-                             (vecs[0][self._vecsegs[ltype][0]:self._vecsegs[ltype][1]][self._vocs[ltype]._type_index[t]]/segsum)), # emission potential
-                       "pt": None}
+        vecseg = detach(vecs[0][self._vecsegs[ltype][0]:self._vecsegs[ltype][1]]); segsum = sum(vecseg) 
+        V = [{}]; pts = [pt for pt in self._vocs[ltype]]
+        V[0]["P"] = self._trIs[ltype]*vecseg/segsum
+        V[0]['pt'] = None
         # continue with chains for each branching point
         for vec in vecs[1:]:
             V.append({}); i = len(V) - 1
-            maxP = 0.
-            segsum = sum(vec[self._vecsegs[ltype][0]:self._vecsegs[ltype][1]])
-            for t in self._vocs[ltype]:
-                P, pt = max([(V[i - 1][pt]["P"] * # probability of chain to this point
-                              (vec[self._vecsegs[ltype][0]:self._vecsegs[ltype][1]][self._vocs[ltype]._type_index[t]]/segsum) * # emission potential
-                              self._trXs[ltype][self._vocs[ltype]._type_index[t],self._vocs[ltype]._type_index[pt]], pt) # transmission potential
-                              for pt in self._vocs[ltype]]); V[i][t] = {"P": P, "pt": pt}
-                if P > maxP:
-                    maxP = P
-            for t in V[i]:
-                V[i][t]['P'] /= maxP
+            vecseg = detach(vec[self._vecsegs[ltype][0]:self._vecsegs[ltype][1]]); segsum = sum(vecseg)
+            V[i]["P"] = ((V[i - 1]["P"]*(self._trXs[ltype]*(vecseg/segsum)).T).T).max(axis = 0)
+            V[i]["pt"] = ((V[i - 1]["P"]*(self._trXs[ltype]*(vecseg/segsum)).T).T).argmax(axis = 0)
+            V[i]["P"] /= V[i]["P"].sum()
         # get most probable state and its backtrack
-        tags = [max(V[-1], key = lambda t: V[-1][t]['P'])]
-        pt = tags[-1]
+        tagixs = [V[-1]["P"].argmax()]
+        tix = tagixs[0]
+#         for i, vec in enumerate(vecs):
+#             vecseg = detach(vec[self._vecsegs[ltype][0]:self._vecsegs[ltype][1]]); segsum = sum(vecseg)
+#             print(V[i]["P"], self.output(vec,ltype))
         # follow the backtrack till the first observation
         for i in range(len(V) - 2, -1, -1):
-            tags.insert(0, V[i + 1][pt]["pt"])
-            pt = V[i + 1][pt]["pt"]
-        return [t[0] for t in tags]
+            tagixs.insert(0, V[i + 1]["pt"][tix])
+            tix = tagixs[0]
+        return [self._vocs[ltype].decode(tix)[0] for tix in tagixs]
 
     # purpose: provide both the most-likely prediction (arg-max) and prediction Counter for a given point
     # arguments: 
@@ -1124,7 +1080,25 @@ class LM(ABC):
     # - decode_method: either 'viterbi' or other, defaulting the arg-max prediction
     # prereqs: not user-driven, operated by .interpret over a stream of prediction vectors (vecs) and an intended decode method
     # output: a list of boolean values indicating the True/False sampling of the prediction
-    def decode_eots(self, vecs, decode_method = 'viterbi'):
+#     def decode_eots(self, vecs, decode_method): # = ['argmax', 'viterbi']
+#         # viterbi decode is_token status for whatevers
+#         if decode_method == 'viterbi':
+#             # iats = self.viterbi(vecs, 'iat')
+#             eots = self.viterbi(vecs, 'eot')
+#         else: # argmax decode is_token status for whatevers
+#             # iats = [list(self.output(vec, 'iat')[1].most_common(1))[0][0][0] for vec in vecs]
+#             eots = [list(self.output(vec, 'eot')[1].most_common(1))[0][0][0] for vec in vecs]
+# #         # fill in determined details, assuming is_token prediction (iat) is accurate
+# #         eots = []
+# #         for wi in range(len(vecs)):
+# #             eots.append(iats[wi])
+# #             if iats[wi] and wi:
+# #                 if not eots[-2]: eots[-2] = True
+#         # enforce boundary constraints (final whatever has to end a token)
+#         if not eots[-1]: eots[-1] = True
+#         return eots
+    
+    def decode_eots(self, vecs, decode_method): # = ['argmax', 'viterbi']
         # viterbi decode is_token status for whatevers
         if decode_method == 'viterbi':
             iats = self.viterbi(vecs, 'iat')
@@ -1202,7 +1176,7 @@ class LM(ABC):
     # - decode_method: either 'viterbi' or other, defaulting the arg-max prediction
     # prereqs: not user-driven, operated by .interpret over a stream of prediction vectors (vecs) and an intended decode method
     # output: a list of boolean values indicating the sampling of the prediction      
-    def decode_tags(self, tvecs, twis, ltype, decode_method = 'viterbi'):
+    def decode_tags(self, tvecs, twis, ltype, decode_method): #  = ['argmax', 'viterbi']
         # viterbi decode pos tags
         if decode_method == 'viterbi':
             ttags = self.viterbi(tvecs, ltype)
@@ -1264,10 +1238,15 @@ class LM(ABC):
     # - dense_predict: bool, if True system will use dense contexts (integrating first-order predictions) for prediction of all tags (experimental)
     # prereqs: a trained model, provided by the .fit method
     # output: NA, system will store tags and other predictables within the ._documents object as per the .grok method
-    def interpret(self, docs, covering = [], all_layers = defaultdict(lambda : defaultdict(list)),
-                  seed = None, predict_tags = True, predict_contexts = False, dense_predict = False):
+    def interpret(self, docs, covering = [], all_layers = defaultdict(lambda : defaultdict(list)), decode_method = 'argmax', # 'viterbi'
+                  eval_layers = defaultdict(lambda : defaultdict(list)), eval_covering = [],
+                  seed = None, predict_tags = True, predict_contexts = False, dense_predict = False, 
+                  verbose = True, return_output = False, verbose_result = False):
         streams, docs = self.encode_streams(docs, covering = covering, all_layers = all_layers)
         self._documents = []; self._sentences = []; self._tokens = []; self._whatevers = []
+        confusion = {seg: {'sp': {"TP": 0, "FP": 0, "FN": 0, "P": 0, "R": 0, "F": 0},
+                   'ns': {"TP": 0, "FP": 0, "FN": 0, "P": 0, "R": 0, "F": 0}} for seg in ['eot', 'eos']}
+        accuracy = {tag: {'sp': defaultdict(list), 'ns': defaultdict(list), 'tsp': [], 'tns': []} for tag in ['pos', 'sty', 'arc']}
         if seed is not None:
             np.random.seed(seed)
         print("Interpreting documents...")
@@ -1282,10 +1261,10 @@ class LM(ABC):
             else:
                 vecs = self.R1(stream)
             atns = detach(stream['amp'])
-            # atns = detach(atns)
             # determine the token segmentation, if necessary
             if not eots: # eot == True means the whatever is a singleton itself; others are compound
-                eots = self.decode_eots(vecs) if predict_tags else [True] * len(vecs)
+                eots = self.decode_eots(vecs, decode_method = decode_method) if predict_tags else [True] * len(vecs)
+            
             tvecs, tnrms, tatns, twis = agg_vecs(vecs, atns, eots)
             # determine the sentence segmentation, if necessary
             if not eoss:
@@ -1300,11 +1279,11 @@ class LM(ABC):
             # determine the part of speech tags, if necessary
             poss = [None for _ in range(len(vecs))]
             if ('pos' in self._lorder) and ('pos' not in all_layers) and predict_tags:
-                poss = self.decode_tags(tvecs, twis, 'pos')
+                poss = self.decode_tags(tvecs, twis, 'pos', decode_method = decode_method)
             # determine the lemma tags, if necessary
             lems = [None for _ in range(len(vecs))]
             if ('lem' in self._lorder) and ('lem' not in all_layers) and predict_tags:
-                lems = self.decode_tags(tvecs, twis, 'lem')
+                lems = self.decode_tags(tvecs, twis, 'lem', decode_method = decode_method)
             # determine the parse tags, if necessary
             sups, deps, infss = [None for _ in range(len(vecs))], [None for _ in range(len(vecs))], [[] for _ in range(len(vecs))]
             if ('sup' in self._lorder) and ('sup' not in all_layers[d_i]) and predict_tags:
@@ -1326,6 +1305,64 @@ class LM(ABC):
                 self.grok(wi, w, eot, eos, eod, w in self._w_set, atns[wi], vecs[wi], seed, 
                           all_vecs, all_atns, all_nrms, all_ixs, tags = tags)
                 wi += 1
+            
+            if covering or eval_covering:
+                cover = covering[d_i] if covering else eval_covering[d_i]
+                eot_confusion, pos_accuracy, eos_confusion, sty_accuracy, arc_accuracy = evaluate_document(self._documents[d_i], eval_layers[d_i], cover)
+                if eot_confusion is not None:
+                    confusion['eot'] = merge_confusion(confusion['eot'], eot_confusion)
+                if pos_accuracy is not None:
+                    accuracy['pos'] = merge_accuracy(accuracy['pos'], pos_accuracy)
+                if eos_confusion is not None:
+                    confusion['eos'] = merge_confusion(confusion['eos'], eos_confusion)
+                if sty_accuracy is not None:
+                    accuracy['sty'] = merge_accuracy(accuracy['sty'], sty_accuracy)
+                if arc_accuracy is not None:
+                    accuracy['arc'] = merge_accuracy(accuracy['arc'], arc_accuracy)
+            
+            # report output
+            if verbose:
+                if eval_covering:
+                    print(f"Document {d_i}'s Sentence segmentation performance: ", 
+                          {(ky, eos_confusion['ns'][ky]) for ky in ['P', 'R', 'F']})
+                if 'sty' in eval_layers[d_i]:
+                    print(f"Document {d_i}'s STY accuracy: ", sum(sty_accuracy['tsp'])/len(sty_accuracy['tsp']))
+                if eval_covering:
+                    print(f"Document {d_i}'s Token segmentation performance without space: ", 
+                          {(ky, eot_confusion['ns'][ky]) for ky in ['P', 'R', 'F']}) 
+                if 'pos' in eval_layers[d_i]:
+                    print(f"Document {d_i}'s POS accuracy with/out space:", sum(pos_accuracy['tsp'])/len(pos_accuracy['tsp']), 
+                          sum(pos_accuracy['tns'])/len(pos_accuracy['tns']))
+                if ('sup' in eval_layers[d_i]) and ('dep' in eval_layers[d_i]):
+                    print(f"Document {d_i}'s SUP:DEP accuracy with/out space: ", sum(arc_accuracy['tsp'])/len(arc_accuracy['tsp']), 
+                          sum(arc_accuracy['tns'])/len(arc_accuracy['tns']))
+                print("")
+        # report output
+        if verbose:
+            if eval_covering:
+                print("Overall sentence segmentation performance: ", {(ky, confusion['eos']['ns'][ky]) for ky in ['P', 'R', 'F']}) 
+            if ('sty' in eval_layers[d_i]):
+                print("Overall STY accuracy: ", sum(accuracy['sty']['tsp'])/len(accuracy['sty']['tsp']))
+                if verbose_result:
+                    print("Tag-wise STY accuracy: ")
+                    pprint(list(Counter({tag: (sum(accuracy['sty']['sp'][tag])/len(accuracy['sty']['sp'][tag]), len(accuracy['sty']['sp'][tag])) 
+                                         for tag in accuracy['sty']['sp']}).most_common()))
+            if eval_covering:
+                print("Overall Token segmentation performance without space: ", {(ky, confusion['eot']['ns'][ky]) for ky in ['P', 'R', 'F']}) 
+            if ('pos' in eval_layers[d_i]):
+                print("Overall POS accuracy with/out space:", sum(accuracy['pos']['tsp'])/len(accuracy['pos']['tsp']), sum(accuracy['pos']['tns'])/len(accuracy['pos']['tns']))
+                if verbose_result:
+                    print("Tag-wise POS accuracy: ") 
+                    pprint(list(Counter({tag: (sum(accuracy['pos']['sp'][tag])/len(accuracy['pos']['sp'][tag]), len(accuracy['pos']['sp'][tag]))
+                                         for tag in accuracy['pos']['sp']}).most_common()))
+            if ('sup' in eval_layers[d_i]) and ('dep' in eval_layers[d_i]):
+                print("Overall SUP:DEP accuracy with/out space: ", sum(accuracy['arc']['tsp'])/len(accuracy['arc']['tsp']), sum(accuracy['arc']['tns'])/len(accuracy['arc']['tns']))
+                if verbose_result:
+                    print("Tag-wise SUP:DEP accuracy: ")
+                    pprint(list(Counter({tag: (sum(accuracy['arc']['sp'][tag])/len(accuracy['arc']['sp'][tag]), len(accuracy['arc']['sp'][tag])) 
+                                         for tag in accuracy['arc']['sp']}).most_common()))
+        if return_output:
+            return confusion, accuracy
 
     # purpose: determine predictions for the forms of a corpus of documents
     # arguments: 
@@ -1347,7 +1384,7 @@ class LM(ABC):
                 vecs = self.R1(stream, ltypes = ['form'], forward = False)
             ps.append([]) 
             for wi, vec in enumerate(vecs):
-                p = vec[stream['form'][wi]]
+                p = vec[stream['form'][wi]] if vec[stream['form'][wi]] else vec[self._vocs['form'].encode(('','oov'))] 
                 ps[-1].append([p, p if self._vocs['form'].decode(int(stream['form'][wi]))[0] != ' ' else None])
             print("document no., pct. complete, 1/<P>, 1/<P> (nsp), M, M (nsp): ", d_i+1, 100*round((d_i+1)/len(docs), 2), 
                   round(1/(10**(np.log10([p[0] for p in ps[-1]]).mean())), 2), 
@@ -1372,7 +1409,7 @@ class LM(ABC):
     # output: if return_output == True: then a list of predictions of prediction probabilities is returned, otherwise NA
     def generate(self, m = 1, prompt = "", docs = [], Td = Counter(), revise = [], top = 1., covering = [], 
                  seed = None, verbose = True, return_output = False, dense_predict = False):
-        test_ps = [[]]; d_i, w_i = 0, 0
+        test_ps = [[]]; d_i, w_i = 0, 0; window = [('',r,'form') for r in range(-self._m,self._m+1)]
         ws = []; streams = []; vecs = []; avecs = []; cvecs = [];
         if docs:
             streams, docs = self.encode_streams(docs, covering = covering)
@@ -1408,19 +1445,14 @@ class LM(ABC):
                 ws = list(ws) + [""] 
                 wi = len(ws) - 1
             if not docs:
-                stream['amps'].append(self.double([0.])); stream['cons'].append(self.long([0])); stream['m0ps'].append(self.long([0]))
+                stream['amps'].append(self.double([0.])); stream['cons'].append(self.array([0])); stream['m0ps'].append(self.long([0]))
                 stream['amp'] = self.double(list(self.get_amps(ws[:wi])) + [0.])
-                for ci in range(max([0,wi - self._m]), wi):
-                    r = ci - wi; c = (ws[ci], r, 'form')
-                    _, encs, impact = self.encode(('', 'form'), c)
-                    cons, amps, m0ps = [], [], []
-                    for enc in encs:
-                        cons.append(self._con_vocs[self._cltype].encode(enc))
-                        amps.append(impact/len(encs))
-                        m0ps.append(int(r/abs(r) if r else r))
-                    stream['cons'][wi] = self.long(cons)
-                    stream['amps'][wi] = self.double(amps)
-                    stream['m0ps'][wi] = self.long(m0ps)
+                stream['cons'][wi] = list(window) # get_context(wi, list(ws), self._m)
+                if len(wis)-1:
+                    start = self._m + 1 - min([self._m + 1,len(ws)]); wstart = start - (self._m + 1)
+                    stream['cons'][wi][start:self._m] = [(w,c[1],c[2]) for w, c in zip(ws[wstart:-1], stream['cons'][wi][start:self._m])]
+                stream['amps'][wi] = self.double([0 if c[1] >= 0 else self.encode(('', 'form'), c)[-1] for c in stream['cons'][wi]])
+                stream['m0ps'][wi] = self.long([int(c[1]/abs(c[1]) if c[1] else c[1]) for c in stream['cons'][wi]])
             if self._fine_tuned or dense_predict: 
                 vecs, avecs, cvecs = self.R2(stream, forward = False, ltypes = ['form'],
                                              previous_avecs = avecs, previous_cvecs = cvecs, 
@@ -1428,10 +1460,11 @@ class LM(ABC):
             else:
                 # get the vectors and attention weights for the sentence
                 vecs = self.R1(stream, forward = False, ltypes = ['form'], previous_vecs = avecs)
-            P = Counter(dict(zip(list(self._vocs['form']), detach(vecs[wi]))))
             
+            P = Counter(dict(zip(list(self._vocs['form']), detach(vecs[wi]))))
             # sample from the resulting distribution over the language model's vocabulary
-            ts, ps = map(np.array, zip(*P.most_common()))
+            ts, ps = map(np.array, zip(*[x for x in P.most_common() if x[0] != ('', 'oov')]))
+            
             if type(top) == float:
                 top = len(ps) if top == 1.0 else len(P) - len(ps[ps[::-1].cumsum() <= top])
                 ts, ps = ts[:top], ps[:top]
@@ -1446,26 +1479,23 @@ class LM(ABC):
             what = np.random.choice([t[0] for t in ts], size=None, replace=True, p=ps/ps.sum()) 
             # replace the last/empty element with the sampled (or stenciled) token
             ws[wi] = doc[wi] if docs else what
-            # this is where we build up the stream if not stenciling
-            if not docs:
-                for ci in range(max([0,wi - self._m]), wi + 1):
-                    r = wi - ci; c = (ws[wi], r, 'form')
-                    _, encs, impact = self.encode(('', 'form'), c)
-                    cons, amps, m0ps = [], [], []
-                    for enc in encs:
-                        cons.append(self._con_vocs[self._cltype].encode(enc))
-                        amps.append(impact/len(encs))
-                        m0ps.append(int(r/abs(r) if r else r))
-                    stream['cons'][wi] = self.long(cons)
-                    stream['amps'][wi] = self.double(amps)
-                    stream['m0ps'][wi] = self.long(m0ps)
+#             # this is where we build up the stream if not stenciling ###################################################### this is necessary for revisions!
+#             if not docs:
+#                 cons, amps, m0ps = [], [], []
+#                 for c in get_context(wi, list(ws), self._m):
+#                     cons.append(c)
+#                     amps.append(0 if c[1] >= 0 else self.encode(('', 'form'), c)[-1])
+#                     m0ps.append(int(c[1]/abs(c[1]) if c[1] else c[1]))
+#                 stream['cons'][wi] = self.array(cons)
+#                 stream['amps'][wi] = self.double(amps)
+#                 stream['m0ps'][wi] = self.long(m0ps)
             # update the process with the sampled type
             sampled += 1; Td[ws[wi]] += 1
-            if return_output: output.append([what, P])
+            if return_output: output.append((what, P, list(stream['cons'][wi])))
             # gather stenciling information
             if docs:
                 w = doc[w_i]
-                test_p = P.get((w,'form'), P[('','form')])
+                test_p = P.get((w,'form'), P[('','oov')])
                 if covering:
                     tok_ps.append(test_p)
                     if eots[d_i][w_i]:
@@ -1498,4 +1528,4 @@ class LM(ABC):
         if revise and not docs:
             if verbose and (wi+1 < len(ws)): print("".join(ws[wi+1:]), end = '')
         if verbose and not docs: print('\n', end = '')
-        if return_output and docs: return test_ps
+        if return_output: return test_ps if docs else output
