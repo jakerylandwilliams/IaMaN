@@ -330,13 +330,16 @@ class Numvec:
     
 class Represent:
     def __init__(self, data = None, bits = 0, numerical = 0, noisy = True, btype = 'nf'):
-        self._bits_set = int(bits); self._numerical = numerical; self._noisy = noisy # ; self._btype = btype
+        self._bits_set = int(bits); self._numerical = numerical; self._noisy = noisy
         if data is None:
             self._bits = 2 # + (1 if numerical else 0)
             self.rep = None if numerical else lambda x: np.array([{'': 0.}.get(x, 1.)])
             self.rep = Edgevec(Numvec(numerical, self.rep)) if numerical else Edgevec(self.rep)
         else:
-            self._f =  Counter([t for d in data for t in d]); self._M = sum(self._f.values()); self._k = len(data)
+            self._f =  Counter([t for d in data for t in d])
+            if ('', 'oov') in self._f: 
+                self._f[('', 'oov')] = len(self._f) - 1
+            self._M = sum(self._f.values()); self._k = len(data)
             self._df = Counter([ti[0] for ti in Counter([(t,i) for i, d in enumerate(data) for t in d])])
             self._n = Counter([self._f[t] for t in self._f])
             self.build_cipher(self._bits_set, btype)
@@ -344,16 +347,24 @@ class Represent:
     def set_btype(self, btype):
         self._btype = btype
         if self._btype == 'df':
-            self._beta = Counter({t: self._df[t]/(self._k + 1) for t in self._df})
+            self._beta = Counter({t: self._df[t]/self._k for t in self._df}) # switch to?: self._df[t]/(self._k + 1)
         elif self._btype == 'nf':
-            self._beta = Counter({t: 1/self._n[self._f[t]] for t in self._f})
-        elif self._btype == 'f':
-            self._beta = Counter({t: self._f[t]*self._n[self._f[t]]/(self._f[t]*self._n[self._f[t]] + 1) for t in self._f})
+            self._beta = Counter({t: 1/self._n[self._f[t]] for t in self._f}) # switch to?: 1/(self._n[self._f[t]] + 1)
+        elif self._btype == 'f': 
+            self._beta = Counter({t: self._f[t]/(self._f[t] + 1) for t in self._f})
+        elif self._btype == 'dfnf':
+            self._beta = Counter({t: ((self._df[t]/self._k) * (1/self._n[self._f[t]])) ** (1/2) for t in self._f})
+        elif self._btype == 'all':
+            self._beta = Counter({t: ((self._df[t]/self._k) * (1/self._n[self._f[t]]) * (self._f[t]/(self._f[t] + 1))) ** (1/3)
+                                  for t in self._f})
         else:
             self._beta = Counter()
         
     def update_cipher(self, data, btype = ''):
-        self._f += Counter([t for d in data for t in d]); self._M = sum(self._f.values()); self._k += len(data)
+        self._f += Counter([t for d in data for t in d])
+        if ('', 'oov') in self._f: 
+            self._f[('', 'oov')] = len(self._f) - 1
+        self._M = sum(self._f.values()); self._k += len(data)
         self._df += Counter([ti[0] for ti in Counter([(t,i) for i, d in enumerate(data) for t in d])])
         self._n = Counter([self._f[t] for t in self._f])
         self.set_btype(btype if btype else self._btype)

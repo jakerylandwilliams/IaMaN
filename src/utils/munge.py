@@ -124,9 +124,10 @@ def build_iats(d, covering):
 def process_document(x, bc = {}): 
     if not type(bc) == dict: # access broadcast variables through spark
         bc = dict(bc.value)
-    d, covering, ltypes, layers = json.loads(x) 
+
+    doc, covering, ltypes, layers = json.loads(x) # d
     # once bc['tokenize'] serializes: replace d with doc
-    # d = [bc['tokenizer'].tokenize(s) for s in doc]
+    d = [bc['tokenize'](s) for s in doc]
     ## build the higher-level training layers (gold linguistic tags)
     ## assures layers conform to sent-tok covering; tags projects to the whatever level
     ltypes, layers = build_layers(d, covering, ltypes, layers)
@@ -140,7 +141,7 @@ def process_document(x, bc = {}):
     else:
         layers = layers + [nvs, ess, eds]
         ltypes = ltypes + ['nov', 'eos', 'eod']
-    return d, layers, ltypes
+    yield d, layers, ltypes
 
 # purpose: count the co-occurrences of whatevers over any target sequence of tags (including whatevers, too) for a document
 # arguments:
@@ -152,37 +153,26 @@ def process_document(x, bc = {}):
 def count(x, bc = {}):
     if not type(bc) == dict: # access broadcast variables through spark
         bc = dict(bc.value)
-    # d, dlayers, dltypes = json.loads(x)
     docs, layers, ltypes = json.loads(x)
     dcons = [[get_context(i, list(unroll(d)), m = bc['m'])
               for s in [[t_s for ds in d for t_s in ds]] for i, t in enumerate(s)] for d in docs]
     # count whatevers and their positional abundance
     yield from Counter([((t,'form'), tuple(c))
                         for d, dcon in zip(docs, dcons)
-                        for s in [[t_s for ds in d for t_s in ds]] for i, t in enumerate(s) for c in dcon[i] # get_context(i, list(unroll(d)), m = bc['m'])
-                        if (bc['post_train'] and ((not bc['f']) or (bc['f'] and (t in bc['f'] and c[0] in bc['f']))))
-                        or not bc['post_train']]).items()
+                        for s in [[t_s for ds in d for t_s in ds]] for i, t in enumerate(s) for c in dcon[i] if t in bc['targets']]).items()
     yield from Counter([((t,'form'), tuple([str(c[1]), c[1], 'attn']))
                         for d, dcon in zip(docs, dcons)
-                        for s in [[t_s for ds in d for t_s in ds]] for i, t in enumerate(s) for c in get_context(i, list(unroll(d)), m = bc['m'])
-                        if (bc['post_train'] and ((not bc['f']) or (bc['f'] and (t in bc['f'] and c[0] in bc['f']))))
-                        or not bc['post_train']]).items()
+                        for s in [[t_s for ds in d for t_s in ds]] for i, t in enumerate(s) for c in dcon[i] if t in bc['targets']]).items()
     # count additional layers and their positional abundance
-#     for dlayer, dltype in zip(dlayers, dltypes):
-#         if dltype == 'form': continue
     yield from Counter([((l,dltype), tuple(c))
                         for d, dcon, dltypes, dlayers in zip(docs, dcons, ltypes, layers) for dltype, dlayer in zip(dltypes, dlayers)
                         for s, s_l in [list(zip(*[(t_s, t_l) for ds, ds_l in zip(d, dlayer) for t_s, t_l in zip(ds, ds_l)]))]
-                        for i, (t, l) in enumerate(list(zip(s,s_l))) for c in dcon[i] # get_context(i, list(unroll(d)), m = bc['m'])
-                        if (bc['post_train'] and ((not bc['f']) or (bc['f'] and (t in bc['f'] and c[0] in bc['f']))))
-                        or not bc['post_train']]).items()
+                        for i, (t, l) in enumerate(list(zip(s,s_l))) for c in dcon[i] if t in bc['targets']]).items()
     ## accrue data for positional distributions
     yield from Counter([((l,dltype), tuple([str(c[1]), c[1], 'attn']))
                         for d, dcon, dltypes, dlayers in zip(docs, dcons, ltypes, layers) for dltype, dlayer in zip(dltypes, dlayers)
                         for s, s_l in [list(zip(*[(t_s, t_l) for ds, ds_l in zip(d, dlayer) for t_s, t_l in zip(ds, ds_l)]))]
-                        for i, (t, l) in enumerate(list(zip(s,s_l))) for c in dcon[i] # get_context(i, list(unroll(d)), m = bc['m']) 
-                        if (bc['post_train'] and ((not bc['f']) or (bc['f'] and (t in bc['f'] and c[0] in bc['f']))))
-                        or not bc['post_train']]).items()
+                        for i, (t, l) in enumerate(list(zip(s,s_l))) for c in dcon[i] if t in bc['targets']]).items()
 
 # purpose: move tensor to gpu (if available)
 # arguments:
